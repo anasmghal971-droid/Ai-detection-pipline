@@ -126,3 +126,17 @@ jobs:
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           UPSTASH_REDIS_URL:    ${{ secrets.UPSTASH_REDIS_URL }}
           UPSTASH_REDIS_TOKEN:  ${{ secrets.UPSTASH_REDIS_TOKEN }}
+
+  init-hf-repo:
+    name: "0/4 Initialize HuggingFace Repo"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install huggingface_hub
+      - name: Init HF Dataset Repo
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: cd python/hf_push && python3 init_hf_repo.py
