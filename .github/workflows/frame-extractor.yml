@@ -1,0 +1,37 @@
+name: Frame & Face Extractor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: frame-extractor
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    name: Extract Frames
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_DATASET_REPO: anas775/DETECT-AI-Dataset
+      FRAME_JOBS_PER_CYCLE: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: python/requirements.txt
+      - name: Install system deps (OpenCV + MediaPipe)
+        run: |
+          sudo apt-get install -yq libglib2.0-0 libsm6 libxext6 libxrender-dev ffmpeg
+          pip install -r python/requirements.txt
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+      - name: Run frame extractor
+        run: cd python && timeout 540 python3 frame_extraction/frame_extractor.py

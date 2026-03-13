@@ -1,0 +1,17 @@
+{
+  "name": "detect-ai-workers",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy:dispatcher": "cd dispatcher && wrangler deploy",
+    "deploy:text": "cd scrapers && wrangler deploy --config wrangler-text.toml",
+    "deploy:image": "cd scrapers && wrangler deploy --config wrangler-image.toml",
+    "deploy:video": "cd scrapers && wrangler deploy --config wrangler-video.toml",
+    "deploy:all": "npm run deploy:dispatcher && npm run deploy:text && npm run deploy:image && npm run deploy:video"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260313.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^3.114.17"
+  }
+}

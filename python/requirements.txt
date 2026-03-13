@@ -1,0 +1,26 @@
+# DETECT-AI Python Worker Requirements
+# Install: pip install -r requirements.txt
+
+# Core
+aiohttp>=3.9.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Data / ML
+pandas>=2.0.0
+pyarrow>=14.0.0
+numpy>=1.24.0
+
+# Computer Vision (frame extractor)
+opencv-python-headless>=4.8.0
+mediapipe>=0.10.0
+
+# Video download
+yt-dlp>=2024.1.0
+
+# HF integration
+huggingface_hub>=0.20.0
+hf_xet>=0.1.0
+
+# Async
+asyncio>=3.4.3

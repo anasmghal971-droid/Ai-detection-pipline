@@ -1,0 +1,19 @@
+name: Initialize HuggingFace Dataset Repo
+
+on:
+  workflow_dispatch:   # Manual trigger only — run ONCE
+
+jobs:
+  init:
+    name: Create HF Repo Structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install huggingface_hub
+      - name: Initialize HF Dataset Repository
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: cd python/hf_push && python3 init_hf_repo.py

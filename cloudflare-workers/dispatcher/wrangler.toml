@@ -1,0 +1,24 @@
+name = "detect-ai-dispatcher"
+main = "index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+PIPELINE_ENABLED = "true"
+WORKER_ID = "dispatcher-01"
+
+# Service bindings — dispatcher calls scrapers directly (zero latency, no HTTP)
+[[services]]
+binding = "TEXT_SCRAPER"
+service = "detect-ai-scraper-text"
+
+[[services]]
+binding = "IMAGE_SCRAPER"
+service = "detect-ai-scraper-image"
+
+[[services]]
+binding = "VIDEO_SCRAPER"
+service = "detect-ai-scraper-video"
