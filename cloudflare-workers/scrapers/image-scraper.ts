@@ -112,6 +112,7 @@ async function scrapePixabay(env: Env): Promise<Partial<DetectAISample>[]> {
 
 // ── 4. Flickr Creative Commons ────────────────────────────────
 async function scrapeFlickr(env: Env): Promise<Partial<DetectAISample>[]> {
+  if (!env.FLICKR_API_KEY) return [];
   // license=4 = CC BY, 5 = CC BY-SA, 7 = No known copyright
   const url = `https://www.flickr.com/services/rest/?method=flickr.photos.search&api_key=${env.FLICKR_API_KEY}&license=4,5,7&sort=interestingness-desc&content_type=1&media=photos&format=json&nojsoncallback=1&per_page=100&extras=url_o,url_l,owner_name,date_taken,tags,description`;
   const resp = await fetchWithRetry(url);

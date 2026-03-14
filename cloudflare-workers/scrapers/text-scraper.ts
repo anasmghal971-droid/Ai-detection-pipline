@@ -404,6 +404,10 @@ export default {
           rawSamples = await scrapeStackExchange(source);
           break;
         case "reddit":
+          if (!env.REDDIT_CLIENT_ID || !env.REDDIT_CLIENT_SECRET) {
+            console.log("Reddit credentials not set — skipping");
+            break;
+          }
           rawSamples = await scrapeReddit(source, env.REDDIT_CLIENT_ID, env.REDDIT_CLIENT_SECRET);
           break;
         case "worldbank":

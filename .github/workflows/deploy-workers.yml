@@ -8,7 +8,9 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# ── Step 1: Init HF repo ──────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# STEP 0: Init HuggingFace repo (runs first, all scrapers wait)
+# ─────────────────────────────────────────────────────────────────
 jobs:
   init-hf-repo:
     name: "🤗 Init HuggingFace Repo"
@@ -24,9 +26,12 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python3 python/hf_push/init_hf_repo.py
 
-  # ── Original scrapers (still needed, run in parallel) ─────────
+  # ───────────────────────────────────────────────────────────────
+  # TEXT SCRAPER (original)
+  # NOTE: REDDIT secrets are OPTIONAL — worker skips Reddit if missing
+  # ───────────────────────────────────────────────────────────────
   deploy-text-scraper:
-    name: "☁️ Text Scraper (original)"
+    name: "☁️ 1 — Text Scraper"
     runs-on: ubuntu-latest
     needs: init-hf-repo
     steps:
@@ -37,21 +42,25 @@ jobs:
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           workingDirectory: cloudflare-workers/scrapers
           command: deploy --config wrangler-text.toml
+          # Only REQUIRED secrets here — missing secrets cause job failure
           secrets: |
             SUPABASE_URL
             SUPABASE_SERVICE_KEY
             NEWSAPI_KEY
-            REDDIT_CLIENT_ID
-            REDDIT_CLIENT_SECRET
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           NEWSAPI_KEY:          ${{ secrets.NEWSAPI_KEY }}
+          # Optional — worker handles empty values gracefully
           REDDIT_CLIENT_ID:     ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
 
+  # ───────────────────────────────────────────────────────────────
+  # IMAGE SCRAPER (original)
+  # NOTE: FLICKR_API_KEY is OPTIONAL — worker skips Flickr if missing
+  # ───────────────────────────────────────────────────────────────
   deploy-image-scraper:
-    name: "☁️ Image Scraper (original)"
+    name: "☁️ 2 — Image Scraper"
     runs-on: ubuntu-latest
     needs: init-hf-repo
     steps:
@@ -62,13 +71,13 @@ jobs:
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           workingDirectory: cloudflare-workers/scrapers
           command: deploy --config wrangler-image.toml
+          # Only REQUIRED secrets — Flickr is optional
           secrets: |
             SUPABASE_URL
             SUPABASE_SERVICE_KEY
             UNSPLASH_ACCESS_KEY
             PEXELS_API_KEY
             PIXABAY_API_KEY
-            FLICKR_API_KEY
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -77,8 +86,12 @@ jobs:
           PIXABAY_API_KEY:      ${{ secrets.PIXABAY_API_KEY }}
           FLICKR_API_KEY:       ${{ secrets.FLICKR_API_KEY }}
 
+  # ───────────────────────────────────────────────────────────────
+  # VIDEO SCRAPER (original)
+  # FIX: explicit --name flag prevents "missing Worker name" error
+  # ───────────────────────────────────────────────────────────────
   deploy-video-scraper:
-    name: "☁️ Video Scraper (original)"
+    name: "☁️ 3 — Video Scraper"
     runs-on: ubuntu-latest
     needs: init-hf-repo
     steps:
@@ -88,7 +101,8 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           workingDirectory: cloudflare-workers/scrapers
-          command: deploy --config wrangler-video.toml
+          # --name explicitly provided to fix "Required Worker name missing" error
+          command: deploy --config wrangler-video.toml --name detect-ai-scraper-video
           secrets: |
             SUPABASE_URL
             SUPABASE_SERVICE_KEY
@@ -102,9 +116,11 @@ jobs:
           YOUTUBE_API_KEY:      ${{ secrets.YOUTUBE_API_KEY }}
           PEXELS_API_KEY:       ${{ secrets.PEXELS_API_KEY }}
 
-  # ── NEW SCALE-OUT WORKERS ─────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
+  # TEXT NEWS WORKER (5 languages)
+  # ───────────────────────────────────────────────────────────────
   deploy-text-news:
-    name: "☁️ Text News (5 languages)"
+    name: "☁️ 4 — Text News (EN/AR/FR/DE/ES)"
     runs-on: ubuntu-latest
     needs: init-hf-repo
     steps:
@@ -114,6 +130,7 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           workingDirectory: cloudflare-workers/text-news
+          command: deploy --name detect-ai-text-news
           secrets: |
             SUPABASE_URL
             SUPABASE_SERVICE_KEY
@@ -121,8 +138,11 @@ jobs:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
+  # ───────────────────────────────────────────────────────────────
+  # IMAGE OPEN WORKER (Open Images / LAION / COCO)
+  # ───────────────────────────────────────────────────────────────
   deploy-image-open:
-    name: "☁️ Image Open (LAION/COCO/OpenImages)"
+    name: "☁️ 5 — Image Open (LAION/COCO/OpenImages)"
     runs-on: ubuntu-latest
     needs: init-hf-repo
     steps:
@@ -132,6 +152,7 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           workingDirectory: cloudflare-workers/image-open
+          command: deploy --name detect-ai-image-open
           secrets: |
             SUPABASE_URL
             SUPABASE_SERVICE_KEY
@@ -139,9 +160,11 @@ jobs:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
-  # ── Dispatcher LAST (binds all scrapers) ──────────────────────
+  # ───────────────────────────────────────────────────────────────
+  # DISPATCHER — runs LAST (has service bindings to all scrapers)
+  # ───────────────────────────────────────────────────────────────
   deploy-dispatcher:
-    name: "☁️ Dispatcher (cron every 5min)"
+    name: "☁️ 6 — Dispatcher (cron every 5min)"
     runs-on: ubuntu-latest
     needs:
       - deploy-text-scraper
@@ -156,6 +179,8 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           workingDirectory: cloudflare-workers/dispatcher
+          command: deploy --name detect-ai-dispatcher
+          # Only secrets that EXIST — optional ones go in env only
           secrets: |
             SUPABASE_URL
             SUPABASE_SERVICE_KEY
@@ -165,9 +190,6 @@ jobs:
             UNSPLASH_ACCESS_KEY
             PEXELS_API_KEY
             PIXABAY_API_KEY
-            FLICKR_API_KEY
-            REDDIT_CLIENT_ID
-            REDDIT_CLIENT_SECRET
             UPSTASH_REDIS_URL
             UPSTASH_REDIS_TOKEN
         env:
