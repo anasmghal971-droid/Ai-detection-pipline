@@ -1,0 +1,8 @@
+name = "detect-ai-text-social"
+main = "index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+PIPELINE_ENABLED = "true"
+WORKER_ID = "text-social-01"

@@ -1,704 +1,339 @@
 """
-============================================================
-DETECT-AI: Hugging Face Push Manager
-============================================================
-Handles ALL pushes to Hugging Face with:
+DETECT-AI — HuggingFace Push Manager v2
+========================================
+Handles pushing Parquet shards to anas775/DETECT-AI-Dataset
+with correct rate limiting for 2M+ samples/day scale.
 
-  THROTTLE PROTECTION:
-  - Token bucket rate limiter (max 50 commits/hour)
-  - Exponential backoff on 429 / 503 errors
-  - Max 100 files per commit (HF hard recommendation)
-  - 5-second minimum gap between commits
-  - Automatic retry up to 5 times per shard
+HF Rate Limits (from official docs):
+  - Max ~50 commits/hour per user (practical limit)
+  - No hard limit on file size per commit
+  - Recommended: large files via LFS, batch ≤100 files/commit
 
-  FOLDER STRUCTURE:
-  anas775/DETECT-AI-Dataset/
-  ├── text/{lang}/part-{NNNN}.parquet
-  ├── image/{lang}/metadata/part-{NNNN}.parquet
-  ├── image/{lang}/frames/{image_id}.jpg
-  ├── video/{lang}/metadata/part-{NNNN}.parquet
-  ├── video/{lang}/frames/{video_id}/full/frame_{N}.png
-  ├── video/{lang}/frames/{video_id}/faces/face_{N}.jpg
-  ├── audio/{lang}/metadata/part-{NNNN}.parquet
-  └── _metadata/
-      ├── shard_registry.json
-      ├── push_log.jsonl
-      └── schema_v1.json
-
-  SHARD RULES (per HF repo limits):
-  - Max 100k files per repo → split by content_type+lang
-  - Max 5GB per file → parquet shards capped at 500k rows
-  - Max 100 files per commit → batch upload in chunks of 50
-  - Parquet compressed with snappy (~0.7x ratio)
-============================================================
+Our strategy for 2M samples/day:
+  - Buffer samples in Supabase until 200k rows (1 shard)
+  - Push 1 Parquet shard = 1 commit
+  - 2M samples/day = 10 shards/day = 10 commits/day → 120x UNDER limit
+  - Push frames in batches of 50 files per commit (well under limit)
+  - Minimum 5 seconds between commits
+  - Exponential backoff on 429/500 errors
 """
 
 import os
-import time
+import io
 import json
-import hashlib
+import time
 import logging
-import threading
-from pathlib import Path
+import hashlib
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
-from dataclasses import dataclass, field
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from huggingface_hub import (
-    HfApi,
-    CommitOperationAdd,
-    create_repo,
-)
-from huggingface_hub.utils import HfHubHTTPError
+import requests
+from huggingface_hub import HfApi, CommitOperationAdd
 
-# ── Logging ──────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-    level=logging.INFO,
-)
 log = logging.getLogger("detect-ai.hf-push")
 
-# ── Configuration ─────────────────────────────────────────────
-HF_REPO_ID          = os.environ.get("HF_DATASET_REPO", "anas775/DETECT-AI-Dataset")
-HF_TOKEN            = os.environ.get("HF_TOKEN", "")
-SUPABASE_URL        = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY        = os.environ.get("SUPABASE_SERVICE_KEY", "")
+HF_TOKEN     = os.environ.get("HF_TOKEN")
+REPO_ID      = os.environ.get("HF_DATASET_REPO", "anas775/DETECT-AI-Dataset")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
-SCHEMA_VERSION      = "1.0"
-SHARD_ROW_LIMIT     = 200_000       # Rows per parquet shard
-MAX_FILES_PER_COMMIT = 50           # Well under HF's 100-file recommendation
-MIN_COMMIT_GAP_SEC  = 5            # Minimum seconds between commits
-MAX_COMMITS_PER_HR  = 50           # Token bucket capacity
-MAX_RETRY_ATTEMPTS  = 5
-BASE_BACKOFF_SEC    = 10           # Base for exponential backoff
+# ── Rate limit config (safe for 2M/day) ─────────────────────────
+SHARD_SIZE          = 200_000   # rows per Parquet shard
+MAX_COMMITS_PER_HR  = 40        # Well under 50/hr limit (20% safety margin)
+MIN_SECONDS_BETWEEN = 5         # Min gap between commits
+MAX_FILES_PER_COMMIT= 50        # Well under HF's ~100 file recommendation
+BACKOFF_BASE        = 30        # Seconds for first retry
+BACKOFF_MAX         = 300       # Max 5 min backoff
 
-# ── 90+ Languages supported ───────────────────────────────────
-SUPPORTED_LANGUAGES = [
-    "en","ar","fr","de","es","zh","ja","ko","pt","ru","hi","it","nl","pl",
-    "sv","tr","vi","fa","uk","he","cs","ro","hu","el","da","fi","no","sk",
-    "hr","bg","sr","lt","lv","et","sl","sq","mk","bs","ca","eu","gl","cy",
-    "ga","is","mt","af","sw","ms","id","tl","th","my","km","lo","ka","hy",
-    "az","kk","uz","tk","ky","tg","mn","si","ne","ur","bn","pa","gu","mr",
-    "ta","te","kn","ml","am","yo","ig","ha","zu","xh","sn","st","tn","so",
-    "rw","mg","ln","wo","ff","bm","tw","ee","ak","ny","lg","kg","ki","sg",
-]
+SB_HEADERS = {
+    "apikey":        SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type":  "application/json",
+    "Prefer":        "return=minimal",
+}
 
-# ── Token Bucket Rate Limiter ─────────────────────────────────
-class TokenBucketLimiter:
-    """
-    Limits commits to MAX_COMMITS_PER_HR per hour.
-    Thread-safe. Blocks until a token is available.
-    """
-    def __init__(self, capacity: int = MAX_COMMITS_PER_HR, refill_period_sec: int = 3600):
-        self.capacity         = capacity
-        self.tokens           = capacity
-        self.refill_period    = refill_period_sec
-        self.refill_rate      = capacity / refill_period_sec  # tokens/sec
-        self.last_refill_time = time.monotonic()
-        self._lock            = threading.Lock()
 
-    def _refill(self):
-        now     = time.monotonic()
-        elapsed = now - self.last_refill_time
-        new_tokens = elapsed * self.refill_rate
-        self.tokens = min(self.capacity, self.tokens + new_tokens)
-        self.last_refill_time = now
-
-    def acquire(self, timeout_sec: int = 3600) -> bool:
-        """Block until a token is available. Returns True if acquired."""
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            with self._lock:
-                self._refill()
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return True
-            wait_sec = 1.0 / self.refill_rate
-            log.info(f"[THROTTLE] Rate limit reached. Waiting {wait_sec:.1f}s for token...")
-            time.sleep(min(wait_sec, 60))
-        return False
-
-# ── Shard Record ──────────────────────────────────────────────
-@dataclass
-class ShardRecord:
-    shard_id:            str
-    content_type:        str
-    language:            str
-    sample_count:        int
-    size_bytes:          int
-    sha256_hash:         str
-    created_at:          str
-    schema_version:      str = SCHEMA_VERSION
-    hf_path:             str = ""
-    push_status:         str = "pending"   # pending | pushed | failed
-    source_distribution: dict = field(default_factory=dict)
-    push_attempts:       int = 0
-    last_error:          str = ""
-
-# ── HF Push Manager ───────────────────────────────────────────
 class HFPushManager:
-    """
-    Manages all Hugging Face dataset pushes for DETECT-AI.
-    Thread-safe, throttle-protected, retry-enabled.
-    """
-
-    def __init__(self):
-        self.api       = HfApi(token=HF_TOKEN)
-        self.limiter   = TokenBucketLimiter()
-        self.push_log  = []
-        self._lock     = threading.Lock()
+    def __init__(self, token: str = HF_TOKEN, repo_id: str = REPO_ID):
+        self.api     = HfApi(token=token)
+        self.repo_id = repo_id
         self._last_commit_time = 0.0
+        self._commits_this_hour = 0
+        self._hour_start = time.time()
 
-        # Local shard staging directory
-        self.staging_dir = Path("/tmp/detect-ai-shards")
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
+    # ── Rate limiter ──────────────────────────────────────────────
+    def _wait_if_needed(self):
+        """Enforce rate limits before any commit."""
+        now = time.time()
 
-        log.info(f"HFPushManager initialized → repo: {HF_REPO_ID}")
+        # Reset hourly counter
+        if now - self._hour_start >= 3600:
+            self._commits_this_hour = 0
+            self._hour_start = now
 
-    # ── Ensure repo exists ────────────────────────────────────
-    def ensure_repo(self):
-        """Create HF dataset repo if it doesn't exist."""
-        try:
-            create_repo(
-                repo_id=HF_REPO_ID,
-                repo_type="dataset",
-                private=False,
-                exist_ok=True,
-                token=HF_TOKEN,
-            )
-            log.info(f"✅ Dataset repo ready: https://huggingface.co/datasets/{HF_REPO_ID}")
-        except Exception as e:
-            log.error(f"Failed to create/verify repo: {e}")
-            raise
+        # Wait if at hourly limit
+        if self._commits_this_hour >= MAX_COMMITS_PER_HR:
+            wait = 3600 - (now - self._hour_start) + 10
+            log.warning(f"  HF hourly limit ({MAX_COMMITS_PER_HR}) reached — waiting {wait:.0f}s")
+            time.sleep(wait)
+            self._commits_this_hour = 0
+            self._hour_start = time.time()
 
-    # ── HF path builder ───────────────────────────────────────
-    @staticmethod
-    def build_hf_path(content_type: str, language: str, shard_id: str, subpath: str = "") -> str:
-        """
-        Build the correct HF repo path for a given shard.
+        # Minimum gap between commits
+        elapsed = time.time() - self._last_commit_time
+        if elapsed < MIN_SECONDS_BETWEEN:
+            time.sleep(MIN_SECONDS_BETWEEN - elapsed)
 
-        text   → text/{lang}/part-{NNNN}.parquet
-        image  → image/{lang}/metadata/part-{NNNN}.parquet
-        video  → video/{lang}/metadata/part-{NNNN}.parquet
-        audio  → audio/{lang}/metadata/part-{NNNN}.parquet
-        frame  → video/{lang}/frames/{video_id}/full/frame_{N}.png
-        face   → video/{lang}/frames/{video_id}/faces/face_{N}.jpg
-        """
-        lang = language if language in SUPPORTED_LANGUAGES else "unknown"
+    def _safe_commit(self, message: str, operations: list, retries: int = 5) -> bool:
+        """Commit with exponential backoff on errors."""
+        self._wait_if_needed()
 
-        if subpath:
-            return f"{content_type}/{lang}/{subpath}"
-
-        if content_type == "text":
-            return f"text/{lang}/{shard_id}.parquet"
-        else:
-            return f"{content_type}/{lang}/metadata/{shard_id}.parquet"
-
-    # ── Build frame path ──────────────────────────────────────
-    @staticmethod
-    def build_frame_path(language: str, video_id: str, frame_index: int,
-                         face: bool = False, texture: bool = False) -> str:
-        """
-        video/{lang}/frames/{video_id}/full/frame_{NNNNN}.png
-        video/{lang}/frames/{video_id}/faces/face_{NNNNN}.jpg
-        video/{lang}/frames/{video_id}/textures/mask_{NNNNN}.png
-        """
-        lang = language if language in SUPPORTED_LANGUAGES else "unknown"
-        idx  = str(frame_index).zfill(5)
-        if texture:
-            return f"video/{lang}/frames/{video_id}/textures/mask_{idx}.png"
-        elif face:
-            return f"video/{lang}/frames/{video_id}/faces/face_{idx}.jpg"
-        else:
-            return f"video/{lang}/frames/{video_id}/full/frame_{idx}.png"
-
-    # ── Compute SHA256 ────────────────────────────────────────
-    @staticmethod
-    def sha256_of_bytes(data: bytes) -> str:
-        return hashlib.sha256(data).hexdigest()
-
-    # ── Serialize to Parquet ──────────────────────────────────
-    def to_parquet_bytes(self, df: pd.DataFrame) -> bytes:
-        """Convert DataFrame to snappy-compressed Parquet bytes."""
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        import io
-        buf = io.BytesIO()
-        pq.write_table(table, buf, compression="snappy")
-        return buf.getvalue()
-
-    # ── Core commit with throttle + retry ─────────────────────
-    def _commit_with_throttle(
-        self,
-        operations: list,
-        commit_message: str,
-        shard_id: str,
-    ) -> bool:
-        """
-        Push a list of CommitOperationAdd to HF with:
-        - Token bucket rate limiting
-        - Minimum 5s gap between commits
-        - Exponential backoff on errors
-        - Up to MAX_RETRY_ATTEMPTS retries
-        """
-        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-            # ── Enforce minimum gap between commits ───────────
-            with self._lock:
-                elapsed = time.time() - self._last_commit_time
-                if elapsed < MIN_COMMIT_GAP_SEC:
-                    sleep_for = MIN_COMMIT_GAP_SEC - elapsed
-                    time.sleep(sleep_for)
-
-            # ── Acquire rate limit token ───────────────────────
-            if not self.limiter.acquire():
-                log.error(f"[{shard_id}] Could not acquire rate limit token after 1hr")
-                return False
-
+        for attempt in range(1, retries + 1):
             try:
-                log.info(f"[{shard_id}] Pushing {len(operations)} file(s) — attempt {attempt}/{MAX_RETRY_ATTEMPTS}")
-
                 self.api.create_commit(
-                    repo_id=HF_REPO_ID,
+                    repo_id=self.repo_id,
                     repo_type="dataset",
-                    operations=operations,
-                    commit_message=commit_message,
                     token=HF_TOKEN,
+                    commit_message=message,
+                    operations=operations,
                 )
-
-                with self._lock:
-                    self._last_commit_time = time.time()
-
-                log.info(f"[{shard_id}] ✅ Pushed successfully on attempt {attempt}")
+                self._last_commit_time = time.time()
+                self._commits_this_hour += 1
                 return True
-
-            except HfHubHTTPError as e:
-                status = e.response.status_code if e.response else 0
-
-                if status == 429:
-                    # Hard rate limit from HF — back off much longer
-                    backoff = BASE_BACKOFF_SEC * (4 ** attempt)
-                    log.warning(f"[{shard_id}] HF 429 rate limit. Backing off {backoff}s...")
-                    time.sleep(min(backoff, 900))  # Cap at 15 min
-
-                elif status in (500, 502, 503, 504):
-                    backoff = BASE_BACKOFF_SEC * (2 ** attempt)
-                    log.warning(f"[{shard_id}] HF server error {status}. Retry in {backoff}s...")
-                    time.sleep(backoff)
-
-                elif status == 401:
-                    log.error(f"[{shard_id}] ❌ HF auth error — check HF_TOKEN")
-                    return False
-
-                elif status == 413:
-                    log.error(f"[{shard_id}] ❌ File too large for HF commit. Reduce shard size.")
-                    return False
-
-                else:
-                    backoff = BASE_BACKOFF_SEC * (2 ** attempt)
-                    log.warning(f"[{shard_id}] HF error {status}: {e}. Retry in {backoff}s...")
-                    time.sleep(backoff)
-
             except Exception as e:
-                backoff = BASE_BACKOFF_SEC * (2 ** attempt)
-                log.warning(f"[{shard_id}] Unexpected error: {e}. Retry in {backoff}s...")
-                time.sleep(backoff)
-
-        log.error(f"[{shard_id}] ❌ All {MAX_RETRY_ATTEMPTS} attempts failed")
+                err = str(e)
+                if "429" in err or "rate" in err.lower():
+                    wait = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_MAX)
+                    log.warning(f"  HF rate limited (attempt {attempt}) — waiting {wait}s")
+                    time.sleep(wait)
+                elif "500" in err or "502" in err or "503" in err:
+                    wait = min(30 * attempt, 120)
+                    log.warning(f"  HF server error (attempt {attempt}) — waiting {wait}s: {err[:100]}")
+                    time.sleep(wait)
+                else:
+                    log.error(f"  HF commit failed (attempt {attempt}): {err[:200]}")
+                    if attempt == retries:
+                        return False
+                    time.sleep(10)
         return False
 
-    # ── Push a Parquet shard ──────────────────────────────────
-    def push_shard(self, df: pd.DataFrame, shard: ShardRecord) -> bool:
+    # ── Main: Push pending Parquet shards ─────────────────────────
+    def push_pending_shards(self) -> int:
         """
-        Push a single Parquet shard to HF.
-        Automatically batches into ≤50 file commits.
+        Pull ready-to-shard samples from Supabase → Parquet → HF.
+        Returns number of shards pushed.
         """
-        # Validate language
-        if shard.language not in SUPPORTED_LANGUAGES:
-            log.warning(f"Unknown language '{shard.language}' — routing to 'unknown' folder")
-            shard.language = "unknown"
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            log.error("SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
+            return 0
 
-        # Serialize to parquet
-        parquet_bytes = self.to_parquet_bytes(df)
-        shard.size_bytes  = len(parquet_bytes)
-        shard.sha256_hash = self.sha256_of_bytes(parquet_bytes)
+        pushed_shards = 0
 
-        hf_path = self.build_hf_path(shard.content_type, shard.language, shard.shard_id)
-        shard.hf_path = hf_path
+        for content_type in ["text", "image", "video", "audio"]:
+            for language in self._get_active_languages(content_type):
+                count = self._count_ready(content_type, language)
+                if count < SHARD_SIZE:
+                    continue
 
-        operations = [
-            CommitOperationAdd(
-                path_in_repo=hf_path,
-                path_or_fileobj=parquet_bytes,
-            )
-        ]
+                # Pull up to SHARD_SIZE rows
+                rows = self._fetch_rows(content_type, language, SHARD_SIZE)
+                if not rows:
+                    continue
 
-        commit_msg = (
-            f"[{shard.content_type}/{shard.language}] Add shard {shard.shard_id} "
-            f"({shard.sample_count:,} samples, schema v{SCHEMA_VERSION})"
-        )
+                shard_num = self._next_shard_num(content_type, language)
+                success = self._push_parquet_shard(rows, content_type, language, shard_num)
 
-        shard.push_attempts += 1
-        success = self._commit_with_throttle(operations, commit_msg, shard.shard_id)
+                if success:
+                    sample_ids = [r["sample_id"] for r in rows]
+                    self._mark_pushed(sample_ids, content_type, language, shard_num)
+                    self._register_shard(content_type, language, shard_num, len(rows))
+                    pushed_shards += 1
+                    log.info(f"  ✅ Shard pushed: {content_type}/{language}/part-{shard_num:04d}.parquet ({len(rows):,} rows)")
 
-        shard.push_status = "pushed" if success else "failed"
-        self._log_push(shard, success)
+        log.info(f"Push cycle complete: {pushed_shards} shards pushed this run")
+        return pushed_shards
 
-        return success
-
-    # ── Push video frames (batched) ───────────────────────────
-    def push_frames(
-        self,
-        video_id: str,
-        language: str,
-        frames: list[dict],   # [{ "frame_index": int, "full_bytes": bytes, "face_bytes": list[bytes] }]
-    ) -> bool:
-        """
-        Push extracted video frames to HF in batched commits.
-        Batches of MAX_FILES_PER_COMMIT files per commit.
-        """
-        all_operations = []
-
-        for frame in frames:
-            idx = frame["frame_index"]
-
-            # Full frame (PNG lossless)
-            if frame.get("full_bytes"):
-                path = self.build_frame_path(language, video_id, idx, face=False)
-                all_operations.append(
-                    CommitOperationAdd(path_in_repo=path, path_or_fileobj=frame["full_bytes"])
-                )
-
-            # Face crops (JPEG 95%)
-            for face_idx, face_bytes in enumerate(frame.get("face_bytes", [])):
-                face_path = self.build_frame_path(language, video_id, idx * 100 + face_idx, face=True)
-                all_operations.append(
-                    CommitOperationAdd(path_in_repo=face_path, path_or_fileobj=face_bytes)
-                )
-
-            # Face texture masks
-            for mask_idx, mask_bytes in enumerate(frame.get("mask_bytes", [])):
-                mask_path = self.build_frame_path(language, video_id, idx * 100 + mask_idx, texture=True)
-                all_operations.append(
-                    CommitOperationAdd(path_in_repo=mask_path, path_or_fileobj=mask_bytes)
-                )
-
-        # ── Split into batches of MAX_FILES_PER_COMMIT ─────────
-        total_ops  = len(all_operations)
-        batch_size = MAX_FILES_PER_COMMIT
-        all_success = True
-
-        for i in range(0, total_ops, batch_size):
-            batch    = all_operations[i : i + batch_size]
-            batch_no = i // batch_size + 1
-            total_batches = (total_ops + batch_size - 1) // batch_size
-
-            commit_msg = (
-                f"[video/{language}/frames/{video_id}] "
-                f"Batch {batch_no}/{total_batches} — {len(batch)} files"
-            )
-            success = self._commit_with_throttle(batch, commit_msg, f"{video_id}-batch{batch_no}")
-            if not success:
-                all_success = False
-                log.error(f"Frame batch {batch_no} failed for video {video_id}")
-
-        return all_success
-
-    # ── Push image files (batched) ────────────────────────────
-    def push_images(
-        self,
-        language: str,
-        images: list[dict],   # [{ "image_id": str, "image_bytes": bytes, "face_bytes": list[bytes] }]
-    ) -> bool:
-        """Push image files and face crops in batched commits."""
-        all_operations = []
-        lang = language if language in SUPPORTED_LANGUAGES else "unknown"
-
-        for img in images:
-            img_id = img["image_id"]
-
-            # Full image
-            ext = img.get("ext", "jpg")
-            path = f"image/{lang}/frames/{img_id}.{ext}"
-            all_operations.append(
-                CommitOperationAdd(path_in_repo=path, path_or_fileobj=img["image_bytes"])
-            )
-
-            # Face crops
-            for fi, face_bytes in enumerate(img.get("face_bytes", [])):
-                face_path = f"image/{lang}/faces/{img_id}_face_{fi:02d}.jpg"
-                all_operations.append(
-                    CommitOperationAdd(path_in_repo=face_path, path_or_fileobj=face_bytes)
-                )
-
-        # Batch push
-        all_success = True
-        for i in range(0, len(all_operations), MAX_FILES_PER_COMMIT):
-            batch    = all_operations[i : i + MAX_FILES_PER_COMMIT]
-            batch_no = i // MAX_FILES_PER_COMMIT + 1
-            success  = self._commit_with_throttle(
-                batch,
-                f"[image/{lang}] Image batch {batch_no} — {len(batch)} files",
-                f"img-batch-{lang}-{batch_no}"
-            )
-            if not success:
-                all_success = False
-        return all_success
-
-    # ── Push shard registry + schema metadata ────────────────
-    def push_metadata(self, shard_registry: list[dict]) -> bool:
-        """Push _metadata/ folder — shard registry + schema."""
-        registry_bytes = json.dumps(shard_registry, indent=2).encode()
-        schema = {
-            "version": SCHEMA_VERSION,
-            "fields": {
-                "sample_id":       "UUID v4 string",
-                "source_id":       "Source identifier string",
-                "source_url":      "Original URL string",
-                "content_type":    "text | image | video | audio",
-                "language":        "ISO-639-1 language code",
-                "raw_content":     "Text content or storage path string",
-                "label":           "AI_GENERATED | HUMAN | UNCERTAIN",
-                "final_confidence":"Float 0.0–1.0",
-                "model_scores":    "Dict of {model_name: score}",
-                "verified":        "Boolean",
-                "scraped_at":      "ISO-8601 timestamp",
-                "labeled_at":      "ISO-8601 timestamp",
-            },
-            "thresholds": {
-                "AI_GENERATED": ">= 0.75",
-                "HUMAN":        "<= 0.35",
-                "UNCERTAIN":    "0.35 < x < 0.75",
-            }
-        }
-        schema_bytes = json.dumps(schema, indent=2).encode()
-
-        operations = [
-            CommitOperationAdd("_metadata/shard_registry.json", registry_bytes),
-            CommitOperationAdd("_metadata/schema_v1.json", schema_bytes),
-        ]
-
-        return self._commit_with_throttle(
-            operations,
-            f"[_metadata] Update shard registry — {len(shard_registry)} shards",
-            "metadata-update"
-        )
-
-    # ── Push README / dataset card ────────────────────────────
-    def push_readme(self) -> bool:
-        readme = f"""---
-license: other
-task_categories:
-- text-classification
-- image-classification
-- video-classification
-language: [{", ".join(SUPPORTED_LANGUAGES[:20])}]
-size_categories:
-- 1B<n<10B
-tags:
-- ai-detection
-- deepfake
-- multi-modal
-- multi-language
-pretty_name: DETECT-AI Dataset
----
-
-# DETECT-AI Dataset
-
-**1B+ samples/month** — Multi-modal, multi-language AI content detection dataset.
-
-## Folder Structure
-
-```
-{HF_REPO_ID}/
-├── text/{{lang}}/part-{{NNNN}}.parquet
-├── image/{{lang}}/metadata/part-{{NNNN}}.parquet
-├── image/{{lang}}/frames/{{image_id}}.jpg
-├── image/{{lang}}/faces/{{image_id}}_face_NN.jpg
-├── video/{{lang}}/metadata/part-{{NNNN}}.parquet
-├── video/{{lang}}/frames/{{video_id}}/full/frame_{{NNNNN}}.png
-├── video/{{lang}}/frames/{{video_id}}/faces/face_{{NNNNN}}.jpg
-├── video/{{lang}}/frames/{{video_id}}/textures/mask_{{NNNNN}}.png
-├── audio/{{lang}}/metadata/part-{{NNNN}}.parquet
-└── _metadata/
-    ├── shard_registry.json
-    └── schema_v1.json
-```
-
-## Labels
-| Label | Threshold |
-|---|---|
-| `AI_GENERATED` | ensemble confidence ≥ 0.75 |
-| `HUMAN` | ensemble confidence ≤ 0.35 |
-| `UNCERTAIN` | 0.35 – 0.75 (flagged for human review) |
-
-## Schema Version: {SCHEMA_VERSION}
-Last updated: {datetime.now(timezone.utc).strftime("%Y-%m-%d")}
-"""
-        return self._commit_with_throttle(
-            [CommitOperationAdd("README.md", readme.encode())],
-            "Update dataset card",
-            "readme"
-        )
-
-    # ── Internal push logger ──────────────────────────────────
-    def _log_push(self, shard: ShardRecord, success: bool):
-        entry = {
-            "shard_id":      shard.shard_id,
-            "content_type":  shard.content_type,
-            "language":      shard.language,
-            "sample_count":  shard.sample_count,
-            "size_bytes":    shard.size_bytes,
-            "sha256":        shard.sha256_hash,
-            "hf_path":       shard.hf_path,
-            "status":        shard.push_status,
-            "attempts":      shard.push_attempts,
-            "timestamp":     datetime.now(timezone.utc).isoformat(),
-            "success":       success,
-        }
-        self.push_log.append(entry)
-        status_icon = "✅" if success else "❌"
-        log.info(f"{status_icon} [{shard.content_type}/{shard.language}] {shard.shard_id} "
-                 f"— {shard.sample_count:,} rows, {shard.size_bytes/1024/1024:.1f}MB")
-
-    # ── Full push pipeline: Supabase → Parquet → HF ──────────
-    def run_shard_export(self, content_type: str, language: str, shard_number: int) -> bool:
-        """
-        Pull processed samples from Supabase → serialize to Parquet → push to HF.
-        Called by the Python labeling worker when threshold (200k) is reached.
-        """
-        import requests
-
-        shard_id = f"part-{str(shard_number).zfill(4)}"
-        log.info(f"Starting shard export: {content_type}/{language}/{shard_id}")
-
-        # Query Supabase for unshareded processed samples
-        response = requests.get(
+    def _get_active_languages(self, content_type: str) -> list[str]:
+        """Get languages that have samples waiting to be pushed."""
+        r = requests.get(
             f"{SUPABASE_URL}/rest/v1/samples_processed",
+            headers=SB_HEADERS,
+            params={
+                "select": "language",
+                "content_type": f"eq.{content_type}",
+                "status": "eq.labeled",
+                "group": "language",
+            },
+            timeout=15
+        )
+        if not r.ok:
+            return ["en"]
+        return list({row["language"] for row in r.json() if row.get("language")}) or ["en"]
+
+    def _count_ready(self, content_type: str, language: str) -> int:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/samples_processed",
+            headers={**SB_HEADERS, "Prefer": "count=exact", "Range": "0-0"},
             params={
                 "content_type": f"eq.{content_type}",
                 "language":     f"eq.{language}",
-                "shard_id":     "is.null",
-                "select":       "sample_id,source_id,source_url,content_type,language,"
-                                "raw_content,metadata,scraped_at,label,final_confidence,"
-                                "model_scores,verified,labeled_at",
-                "limit":        str(SHARD_ROW_LIMIT),
-                "order":        "labeled_at.asc",
+                "status":       "eq.labeled",
+                "hf_pushed":    "eq.false",
             },
-            headers={
-                "apikey":        SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            },
-            timeout=120,
+            timeout=15
         )
+        if not r.ok:
+            return 0
+        return int(r.headers.get("Content-Range", "0-0/0").split("/")[-1])
 
-        if not response.ok:
-            log.error(f"Supabase query failed: {response.status_code} {response.text}")
+    def _fetch_rows(self, content_type: str, language: str, limit: int) -> list[dict]:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/samples_processed",
+            headers=SB_HEADERS,
+            params={
+                "select": "*",
+                "content_type": f"eq.{content_type}",
+                "language":     f"eq.{language}",
+                "status":       "eq.labeled",
+                "hf_pushed":    "eq.false",
+                "order":        "labeled_at.asc",
+                "limit":        limit,
+            },
+            timeout=30
+        )
+        return r.json() if r.ok else []
+
+    def _next_shard_num(self, content_type: str, language: str) -> int:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/shard_registry",
+            headers=SB_HEADERS,
+            params={
+                "select": "shard_index",
+                "content_type": f"eq.{content_type}",
+                "language":     f"eq.{language}",
+                "order":        "shard_index.desc",
+                "limit":        1,
+            },
+            timeout=10
+        )
+        rows = r.json() if r.ok else []
+        return (rows[0]["shard_index"] + 1) if rows else 0
+
+    def _push_parquet_shard(
+        self, rows: list[dict], content_type: str, language: str, shard_num: int
+    ) -> bool:
+        """Convert rows to Parquet and push to HF."""
+        try:
+            df = pd.DataFrame(rows)
+            # Keep only HF-relevant columns
+            keep = [
+                "sample_id", "source_id", "source_url", "content_type", "language",
+                "raw_content", "label", "final_confidence", "model_scores",
+                "verified", "scraped_at", "labeled_at", "metadata"
+            ]
+            df = df[[c for c in keep if c in df.columns]]
+
+            # Serialize metadata + model_scores as strings
+            for col in ["metadata", "model_scores"]:
+                if col in df.columns:
+                    df[col] = df[col].apply(
+                        lambda x: json.dumps(x) if isinstance(x, (dict, list)) else str(x or "")
+                    )
+
+            buf = io.BytesIO()
+            df.to_parquet(buf, engine="pyarrow", compression="snappy", index=False)
+            parquet_bytes = buf.getvalue()
+
+            shard_path = f"{content_type}/{language}/part-{shard_num:04d}.parquet"
+            sha256 = hashlib.sha256(parquet_bytes).hexdigest()
+
+            operations = [CommitOperationAdd(shard_path, parquet_bytes)]
+            message = (
+                f"[shard] {content_type}/{language}/part-{shard_num:04d} "
+                f"({len(rows):,} samples, {len(parquet_bytes)//1024}KB)"
+            )
+            return self._safe_commit(message, operations)
+
+        except Exception as e:
+            log.error(f"  Parquet build failed: {e}")
             return False
 
-        rows = response.json()
-        if not rows:
-            log.info(f"No unshareded samples for {content_type}/{language}")
-            return True
-
-        df = pd.DataFrame(rows)
-        # Flatten metadata JSONB column
-        if "metadata" in df.columns:
-            df["metadata"] = df["metadata"].apply(
-                lambda x: json.dumps(x) if isinstance(x, dict) else x
-            )
-        if "model_scores" in df.columns:
-            df["model_scores"] = df["model_scores"].apply(
-                lambda x: json.dumps(x) if isinstance(x, dict) else x
-            )
-
-        shard = ShardRecord(
-            shard_id=shard_id,
-            content_type=content_type,
-            language=language,
-            sample_count=len(df),
-            size_bytes=0,
-            sha256_hash="",
-            created_at=datetime.now(timezone.utc).isoformat(),
-            source_distribution=df["source_id"].value_counts().to_dict(),
-        )
-
-        success = self.push_shard(df, shard)
-
-        if success:
-            # Update shard_id in Supabase for all exported samples
-            sample_ids = df["sample_id"].tolist()
+    def _mark_pushed(self, sample_ids: list[str], content_type: str, language: str, shard_num: int):
+        """Mark samples as HF-pushed in batches of 500."""
+        for i in range(0, len(sample_ids), 500):
+            batch = sample_ids[i:i+500]
             requests.patch(
                 f"{SUPABASE_URL}/rest/v1/samples_processed",
-                params={"sample_id": f"in.({','.join(sample_ids)})"},
-                json={"shard_id": shard_id, "exported_at": datetime.now(timezone.utc).isoformat()},
-                headers={
-                    "apikey":        SUPABASE_KEY,
-                    "Authorization": f"Bearer {SUPABASE_KEY}",
-                    "Content-Type":  "application/json",
-                },
-                timeout=60,
+                headers=SB_HEADERS,
+                params={"sample_id": f"in.({','.join(batch)})"},
+                json={"hf_pushed": True, "hf_shard": shard_num, "status": "pushed"},
+                timeout=20
             )
 
-            # Register shard in Supabase shard_registry
-            requests.post(
-                f"{SUPABASE_URL}/rest/v1/shard_registry",
-                json={
-                    "shard_id":            shard.shard_id,
-                    "content_type":        shard.content_type,
-                    "language":            shard.language,
-                    "sample_count":        shard.sample_count,
-                    "size_bytes":          shard.size_bytes,
-                    "sha256_hash":         shard.sha256_hash,
-                    "created_at":          shard.created_at,
-                    "schema_version":      SCHEMA_VERSION,
-                    "hf_url":              f"https://huggingface.co/datasets/{HF_REPO_ID}/blob/main/{shard.hf_path}",
-                    "push_status":         "pushed",
-                    "source_distribution": shard.source_distribution,
-                },
-                headers={
-                    "apikey":        SUPABASE_KEY,
-                    "Authorization": f"Bearer {SUPABASE_KEY}",
-                    "Content-Type":  "application/json",
-                    "Prefer":        "resolution=merge-duplicates",
-                },
-                timeout=30,
-            )
+    def _register_shard(self, content_type: str, language: str, shard_num: int, row_count: int):
+        """Record shard in registry."""
+        hf_path = f"https://huggingface.co/datasets/{self.repo_id}/resolve/main/{content_type}/{language}/part-{shard_num:04d}.parquet"
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/shard_registry",
+            headers=SB_HEADERS,
+            json={
+                "shard_id":     f"{content_type}-{language}-{shard_num:04d}",
+                "content_type": content_type,
+                "language":     language,
+                "shard_index":  shard_num,
+                "row_count":    row_count,
+                "hf_url":       hf_path,
+                "pushed_at":    datetime.now(timezone.utc).isoformat(),
+            },
+            timeout=10
+        )
 
-        return success
+    # ── Push video frames ─────────────────────────────────────────
+    def push_frames(self, video_id: str, language: str, frame_data: list[dict]) -> bool:
+        """
+        Push extracted frames/faces to HF in batches of MAX_FILES_PER_COMMIT.
+        Each batch = 1 commit. 50 files/commit, 5s gap = safe for any volume.
+        """
+        all_ops = []
+        lang = language[:2] if language else "en"
+
+        for fd in frame_data:
+            idx = str(fd["frame_index"]).zfill(5)
+            if fd.get("full_bytes"):
+                all_ops.append(CommitOperationAdd(
+                    f"video/{lang}/frames/{video_id}/full/frame_{idx}.png",
+                    fd["full_bytes"]
+                ))
+            for fi, fb in enumerate(fd.get("face_bytes") or []):
+                all_ops.append(CommitOperationAdd(
+                    f"video/{lang}/frames/{video_id}/faces/face_{idx}_{fi:02d}.jpg",
+                    fb
+                ))
+            for mi, mb in enumerate(fd.get("mask_bytes") or []):
+                all_ops.append(CommitOperationAdd(
+                    f"video/{lang}/frames/{video_id}/textures/mask_{idx}_{mi:02d}.png",
+                    mb
+                ))
+
+        # Push in batches of MAX_FILES_PER_COMMIT
+        total_batches = (len(all_ops) + MAX_FILES_PER_COMMIT - 1) // MAX_FILES_PER_COMMIT
+        success_count = 0
+        for i in range(0, len(all_ops), MAX_FILES_PER_COMMIT):
+            batch_num = i // MAX_FILES_PER_COMMIT + 1
+            batch = all_ops[i:i + MAX_FILES_PER_COMMIT]
+            message = f"[frames] {video_id} batch {batch_num}/{total_batches} ({len(batch)} files)"
+            if self._safe_commit(message, batch):
+                success_count += 1
+
+        log.info(f"  Frames pushed: {success_count}/{total_batches} batches for {video_id}")
+        return success_count == total_batches
 
 
-# ── CLI Entry Point ───────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
     manager = HFPushManager()
-
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "setup"
-
-    if cmd == "setup":
-        # Initialize repo + push README + schema
-        print("Setting up DETECT-AI HF dataset repo...")
-        manager.ensure_repo()
-        manager.push_readme()
-        manager.push_metadata([])
-        print(f"\n✅ Done! View at: https://huggingface.co/datasets/{HF_REPO_ID}")
-
-    elif cmd == "export":
-        # Export specific shard: python hf_push_manager.py export text en 0
-        content_type = sys.argv[2]
-        language     = sys.argv[3]
-        shard_no     = int(sys.argv[4])
-        manager.ensure_repo()
-        manager.run_shard_export(content_type, language, shard_no)
-
-    elif cmd == "test-throttle":
-        # Test the rate limiter
-        print("Testing token bucket limiter (will do 5 fake commits)...")
-        for i in range(5):
-            manager.limiter.acquire()
-            print(f"Token {i+1} acquired. Tokens remaining: {manager.limiter.tokens:.1f}")
-            time.sleep(1)
-        print("Throttle test complete.")
+    shards = manager.push_pending_shards()
+    print(f"✅ {shards} shards pushed to HF")
