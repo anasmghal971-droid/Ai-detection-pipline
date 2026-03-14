@@ -141,3 +141,19 @@ jobs:
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           UPSTASH_REDIS_URL:    ${{ secrets.UPSTASH_REDIS_URL }}
           UPSTASH_REDIS_TOKEN:  ${{ secrets.UPSTASH_REDIS_TOKEN }}
+
+  deploy-edge-functions:
+    name: "🚀 Deploy Supabase Edge Functions"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Deploy analyze-audio Edge Function
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          supabase functions deploy analyze-audio \
+            --project-ref igwimowqtbgatqvdrqjf \
+            --no-verify-jwt

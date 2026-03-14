@@ -48,6 +48,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from texture_analyzer import analyze_image
+from temporal_consistency import compute_temporal_consistency, score_temporal_consistency
 
 log = logging.getLogger("detect-ai.frame-extractor")
 logging.basicConfig(
@@ -476,6 +477,39 @@ def extract_video(job: dict) -> dict:
             frame_idx += 1
 
         cap.release()
+
+        # ── Temporal consistency analysis ─────────────────────
+        # Run AFTER all frames extracted — needs sequence of frames
+        temporal_signals = {}
+        if len(hf_frame_data) >= 3:
+            try:
+                # Reconstruct frame sequence from hf_frame_data
+                decoded_frames = []
+                bbox_sequence = []
+                for fd, fr in zip(hf_frame_data, frame_records):
+                    buf = np.frombuffer(fd["full_bytes"], dtype=np.uint8)
+                    frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                    if frame is None:
+                        # PNG decode
+                        frame = cv2.imdecode(np.frombuffer(fd["full_bytes"], dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+                    if frame is not None:
+                        decoded_frames.append(frame)
+                        bboxes = fr.get("bounding_boxes", [])
+                        bbox_sequence.append(bboxes[0] if bboxes else None)
+
+                if len(decoded_frames) >= 3:
+                    temporal_signals = compute_temporal_consistency(decoded_frames, bbox_sequence)
+                    temporal_verdict = score_temporal_consistency(temporal_signals)
+                    temporal_signals["temporal_verdict"] = temporal_verdict
+                    log.info(f"  Temporal verdict: {temporal_verdict['verdict']} (score={temporal_verdict['deepfake_score']:.2f})")
+            except Exception as te:
+                log.warning(f"  Temporal analysis failed: {te}")
+
+        # Attach temporal signals to each frame record
+        for fr in frame_records:
+            if "texture_signals" not in fr:
+                fr["texture_signals"] = {}
+            fr["texture_signals"]["temporal"] = temporal_signals
 
         # ── Batch insert frame_metadata ───────────────────────
         if frame_records:
