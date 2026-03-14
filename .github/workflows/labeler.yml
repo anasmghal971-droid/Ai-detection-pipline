@@ -2,31 +2,28 @@ name: AI Ensemble Labeler
 
 on:
   schedule:
-    - cron: "*/2 * * * *"
+    - cron: "*/2 * * * *"   # every 2 minutes
   workflow_dispatch:
 
-concurrency:
-  group: labeler
-  cancel-in-progress: false
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   label:
-    name: Label Batch
+    name: "🤖 Label Batch"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_DATASET_REPO: anas775/DETECT-AI-Dataset
-      LABELER_BATCH_SIZE: "50"
-      SHARD_THRESHOLD: "200000"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: python/requirements.txt
-      - run: pip install -r python/requirements.txt
-      - run: cd python && timeout 240 python3 labeling/ensemble_labeler_once.py
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r python/requirements.txt
+      - name: Run AI Labeler
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          HF_TOKEN:             ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO:      "anas775/DETECT-AI-Dataset"
+        run: python3 python/labeling/ensemble_labeler_once.py
