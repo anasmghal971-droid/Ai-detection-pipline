@@ -144,60 +144,69 @@ async function dispatchToScraper(
   env: Env,
   logger: PipelineLogger
 ): Promise<{ success: boolean; samplesScraped: number; rateLimited?: boolean }> {
-  // Route to the appropriate scraper worker via internal fetch
-  // In production, these are separate named Cloudflare Workers
-  const scraperEndpoints: Record<string, string> = {
-    "bbc-news":       "https://detect-ai-scraper-text.workers.dev",
-    "reuters":        "https://detect-ai-scraper-text.workers.dev",
-    "aljazeera":      "https://detect-ai-scraper-text.workers.dev",
-    "arxiv":          "https://detect-ai-scraper-text.workers.dev",
-    "wikipedia":      "https://detect-ai-scraper-text.workers.dev",
-    "paperswithcode": "https://detect-ai-scraper-text.workers.dev",
-    "newsapi":        "https://detect-ai-scraper-text.workers.dev",
-    "stackexchange":  "https://detect-ai-scraper-text.workers.dev",
-    "reddit":         "https://detect-ai-scraper-text.workers.dev",
-    "worldbank":      "https://detect-ai-scraper-text.workers.dev",
-    "unsplash":       "https://detect-ai-scraper-image.workers.dev",
-    "pexels":         "https://detect-ai-scraper-image.workers.dev",
-    "pixabay":        "https://detect-ai-scraper-image.workers.dev",
-    "openverse":      "https://detect-ai-scraper-image.workers.dev",
-    "nasa":           "https://detect-ai-scraper-image.workers.dev",
-    "met-museum":     "https://detect-ai-scraper-image.workers.dev",
-    "wikimedia":      "https://detect-ai-scraper-image.workers.dev",
-    "pexels-video":   "https://detect-ai-scraper-video.workers.dev",
-    "youtube":        "https://detect-ai-scraper-video.workers.dev",
-    "ted-talks":      "https://detect-ai-scraper-video.workers.dev",
-    "voxceleb":       "https://detect-ai-scraper-video.workers.dev",
+  // CF docs: Worker-to-Worker communication MUST use service bindings
+  // fetch() to workers.dev URLs does NOT work between workers
+  // Service bindings are declared in wrangler.toml [[services]] blocks
+
+  // Map source_id to the correct service binding on env
+  type Fetcher = { fetch: (url: string, init?: RequestInit) => Promise<Response> };
+  const scraperMap: Record<string, Fetcher | undefined> = {
+    // Text sources
+    "bbc-news":        env.SCRAPER_TEXT,
+    "reuters":         env.SCRAPER_TEXT,
+    "aljazeera":       env.SCRAPER_TEXT,
+    "arxiv":           env.SCRAPER_TEXT,
+    "wikipedia":       env.SCRAPER_TEXT,
+    "paperswithcode":  env.SCRAPER_TEXT,
+    "newsapi":         env.SCRAPER_TEXT,
+    "stackexchange":   env.SCRAPER_TEXT,
+    "reddit":          env.SCRAPER_TEXT,
+    "worldbank":       env.SCRAPER_TEXT,
+    // Image sources
+    "unsplash":        env.SCRAPER_IMAGE,
+    "pexels":          env.SCRAPER_IMAGE,
+    "pixabay":         env.SCRAPER_IMAGE,
+    "wikimedia":       env.SCRAPER_IMAGE,
+    "openverse":       env.SCRAPER_IMAGE,
+    "nasa":            env.SCRAPER_IMAGE,
+    "met-museum":      env.SCRAPER_IMAGE,
+    // Video sources
+    "pexels-video":    env.SCRAPER_VIDEO,
+    "youtube":         env.SCRAPER_VIDEO,
+    "ted-talks":       env.SCRAPER_VIDEO,
+    "voxceleb":        env.SCRAPER_VIDEO,
   };
 
-  const endpoint = scraperEndpoints[source.source_id];
-  if (!endpoint) {
+  const scraper = scraperMap[source.source_id];
+  if (!scraper) {
     logger.log("SCRAPE_ERROR", {
       source_id: source.source_id,
-      error_message: `No scraper registered for source: ${source.source_id}`,
+      error_message: `No service binding for source: ${source.source_id}`,
     });
     return { success: false, samplesScraped: 0 };
   }
 
+  // Call via service binding — same Cloudflare network, zero latency
+  const payload = JSON.stringify({
+    source,
+    worker_id:    env.WORKER_ID,
+    supabase_url: env.SUPABASE_URL,
+    supabase_key: env.SUPABASE_SERVICE_KEY,
+  });
+
   const response = await withRetry(() =>
-    fetch(endpoint, {
+    scraper.fetch("https://internal/scrape", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        source,
-        worker_id: env.WORKER_ID,
-        supabase_url: env.SUPABASE_URL,
-        supabase_key: env.SUPABASE_SERVICE_KEY,
-      }),
+      body: payload,
     })
   );
 
   if (response.status === 429) {
     return { success: false, samplesScraped: 0, rateLimited: true };
   }
-
   if (!response.ok) {
-    throw new Error(`Scraper returned ${response.status}: ${await response.text()}`);
+    throw new Error(`Scraper ${source.source_id} returned ${response.status}: ${await response.text()}`);
   }
 
   const result = await response.json() as { samples_scraped: number };
@@ -308,24 +317,43 @@ export default {
   },
 
   // ── Cron Trigger: runs every 5 minutes ───────────────────────
-  // Schedule in wrangler.toml: crons = ["*/5 * * * *"]
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
       (async () => {
         if (env.PIPELINE_ENABLED !== "true") return;
 
-        // Fire 20 concurrent worker cycles
-        const workerCycles = Array.from({ length: 20 }, (_, i) =>
-          fetch("https://detect-ai-dispatcher.workers.dev", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Worker-ID": `worker-${String(i + 1).padStart(2, "0")}`,
-            },
-          }).catch((e) => console.error(`Worker ${i} failed: ${e}`))
-        );
+        const logger = new PipelineLogger(env);
+        logger.log("CRON_TICK", { timestamp: new Date().toISOString() });
 
-        await Promise.allSettled(workerCycles);
+        // Process up to 10 sources per cron cycle concurrently
+        // Each claimNextSource() picks the highest-priority pending source
+        const cycles = Array.from({ length: 10 }, async (_, i) => {
+          const source = await claimNextSource(env, logger).catch(() => null);
+          if (!source) return;
+
+          const hb = setInterval(() => updateHeartbeat(env, source.source_id), HEARTBEAT_INTERVAL_MS);
+          try {
+            const result = await dispatchToScraper(source, env, logger);
+            clearInterval(hb);
+            if (result.rateLimited) {
+              await rateLimitSource(env, source.source_id);
+            } else {
+              await completeSource(env, source.source_id, result.success);
+              logger.log("SCRAPE_COMPLETE", {
+                source_id: source.source_id,
+                sample_count: result.samplesScraped,
+              });
+            }
+          } catch (e) {
+            clearInterval(hb);
+            const msg = e instanceof Error ? e.message : String(e);
+            await completeSource(env, source.source_id, false, msg);
+            logger.log("SCRAPE_ERROR", { source_id: source.source_id, error_message: msg });
+          }
+        });
+
+        await Promise.allSettled(cycles);
+        await logger.flush();
       })()
     );
   },

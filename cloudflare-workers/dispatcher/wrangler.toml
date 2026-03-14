@@ -9,3 +9,25 @@ crons = ["*/5 * * * *"]
 [vars]
 PIPELINE_ENABLED = "true"
 WORKER_ID = "dispatcher-01"
+
+# Service bindings — correct CF Worker-to-Worker communication
+# (HTTP fetch to workers.dev URLs does NOT work per CF docs)
+[[services]]
+binding = "SCRAPER_TEXT"
+service = "detect-ai-scraper-text"
+
+[[services]]
+binding = "SCRAPER_IMAGE"
+service = "detect-ai-scraper-image"
+
+[[services]]
+binding = "SCRAPER_VIDEO"
+service = "detect-ai-scraper-video"
+
+[[services]]
+binding = "SCRAPER_TEXT_NEWS"
+service = "detect-ai-text-news"
+
+[[services]]
+binding = "SCRAPER_IMAGE_OPEN"
+service = "detect-ai-image-open"
