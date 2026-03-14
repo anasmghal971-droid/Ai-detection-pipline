@@ -112,7 +112,7 @@ async function scrapeYouTube(
       searchUrl.searchParams.set("q", topic);
       searchUrl.searchParams.set("type", "video");
       searchUrl.searchParams.set("relevanceLanguage", lang);
-      searchUrl.searchParams.set("videoCaption", "closedCaption");  // Only captioned
+      searchUrl.searchParams.set("videoDefinition", "high");       // HD only
       searchUrl.searchParams.set("videoLicense", "creativeCommon"); // CC-licensed
       searchUrl.searchParams.set("maxResults", "10");
       searchUrl.searchParams.set("key", env.YOUTUBE_API_KEY);

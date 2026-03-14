@@ -176,7 +176,11 @@ async function scrapeNewsAPI(
   _source: SourceQueueItem,
   apiKey: string
 ): Promise<Partial<DetectAISample>[]> {
-  const url = `https://newsapi.org/v2/top-headlines?pageSize=100&apiKey=${apiKey}`;
+  // /v2/top-headlines requires country OR sources param
+  // /v2/everything works for all plans without restrictions
+  const topics = ["technology","science","health","business","politics","world","AI","climate"];
+  const topic = topics[Math.floor(Math.random() * topics.length)];
+  const url = `https://newsapi.org/v2/everything?q=${topic}&pageSize=100&sortBy=publishedAt&language=en&apiKey=${apiKey}`;
   const response = await fetchWithRetry(url);
   const data = await response.json() as {
     articles: Array<{
