@@ -111,7 +111,7 @@ async function completeSource(
   const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
 
   await db.from("sources_queue").update({
-    status: success ? "completed" : "failed",
+    status: success ? "pending" : "failed",  // 'pending' so sources rotate every cycle
     last_crawled_at: new Date().toISOString(),
     worker_id: null,
     heartbeat_at: null,
@@ -327,7 +327,8 @@ export default {
 
         // Process up to 10 sources per cron cycle concurrently
         // Each claimNextSource() picks the highest-priority pending source
-        const cycles = Array.from({ length: 10 }, async (_, i) => {
+        // 3 concurrent cycles — prevents any single API from being rate-limited
+        const cycles = Array.from({ length: 3 }, async (_, i) => {
           const source = await claimNextSource(env, logger).catch(() => null);
           if (!source) return;
 
