@@ -1,0 +1,38 @@
+name: Supabase Buffer Cleanup
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cleanup:
+    name: "🧹 Clean Supabase Buffer"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run cleanup via Supabase RPC
+        run: |
+          RESULT=$(curl -s -X POST \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/rpc/run_full_cleanup" \
+            -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "Cleanup result: $RESULT"
+
+      - name: Check storage usage
+        run: |
+          curl -s \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/storage_usage?select=table_name,total_size,live_rows" \
+            -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" | \
+            python3 -c "
+import sys, json
+rows = json.load(sys.stdin)
+print('Storage usage:')
+for r in rows:
+    print(f'  {r[\"table_name\"]:25s} {r[\"total_size\"]:>10s}  ({r[\"live_rows\"]:,} rows)')
+"

@@ -149,8 +149,10 @@ class HFPushManager:
                     sample_ids = [r["sample_id"] for r in rows]
                     self._mark_pushed(sample_ids, content_type, language, shard_num)
                     self._register_shard(content_type, language, shard_num, len(rows))
+                    # DELETE from Supabase after confirmed HF push — keeps storage under limit
+                    self._delete_pushed_from_supabase(sample_ids)
                     pushed_shards += 1
-                    log.info(f"  ✅ Shard pushed: {content_type}/{language}/part-{shard_num:04d}.parquet ({len(rows):,} rows)")
+                    log.info(f"  ✅ Shard pushed & cleaned: {content_type}/{language}/part-{shard_num:04d}.parquet ({len(rows):,} rows)")
 
         log.info(f"Push cycle complete: {pushed_shards} shards pushed this run")
         return pushed_shards
@@ -289,6 +291,26 @@ class HFPushManager:
             },
             timeout=10
         )
+
+
+    def _delete_pushed_from_supabase(self, sample_ids: list[str]):
+        """
+        Delete rows from samples_processed after confirmed HF push.
+        Supabase is a buffer only — HF is the permanent store.
+        Batched in 500s to avoid request size limits.
+        """
+        for i in range(0, len(sample_ids), 500):
+            batch = sample_ids[i:i+500]
+            id_list = ",".join(f'"{sid}"' for sid in batch)
+            try:
+                requests.delete(
+                    f"{SUPABASE_URL}/rest/v1/samples_processed",
+                    headers=SB_HEADERS,
+                    params={"sample_id": f"in.({id_list})"},
+                    timeout=20
+                )
+            except Exception as e:
+                log.warning(f"  Cleanup delete failed (non-critical): {e}")
 
     # ── Push video frames ─────────────────────────────────────────
     def push_frames(self, video_id: str, language: str, frame_data: list[dict]) -> bool:
