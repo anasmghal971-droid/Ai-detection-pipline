@@ -44,6 +44,10 @@ import numpy as np
 import mediapipe as mp
 import aiohttp
 import requests
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+from texture_analyzer import analyze_image
 
 log = logging.getLogger("detect-ai.frame-extractor")
 logging.basicConfig(
@@ -411,6 +415,18 @@ def extract_video(job: dict) -> dict:
                 frame_idx += 1
                 continue
 
+            # ── Deep texture analysis (15 signals) ────────────
+            face_crop_for_analysis = faces[0]["crop"] if faces else None
+            try:
+                texture_signals = analyze_image(
+                    img_bgr=frame,
+                    face_crop_bgr=face_crop_for_analysis,
+                    image_bytes=full_bytes,
+                )
+            except Exception as te:
+                log.warning(f"  Texture analysis failed frame {idx_str}: {te}")
+                texture_signals = {}
+
             # ── Frame metadata record ──────────────────────────
             frame_records.append({
                 "frame_id":               str(uuid.uuid4()),
@@ -427,6 +443,23 @@ def extract_video(job: dict) -> dict:
                 "full_frame_path":        full_url,
                 "face_crop_paths":        face_urls,
                 "face_texture_mask_paths": mask_urls,
+                "texture_signals": {
+                    "laplacian_variance":      texture_signals.get("laplacian_variance"),
+                    "noise_sigma":             texture_signals.get("noise_sigma"),
+                    "dct_high_freq_energy":    texture_signals.get("dct_high_freq_energy"),
+                    "fft_radial_profile":      texture_signals.get("fft_radial_profile"),
+                    "edge_density":            texture_signals.get("edge_density"),
+                    "local_contrast_std":      texture_signals.get("local_contrast_std"),
+                    "compression_score":       texture_signals.get("compression_score"),
+                    "gradient_magnitude_mean": texture_signals.get("gradient_magnitude_mean"),
+                    "color_coherence":         texture_signals.get("color_coherence"),
+                    "saturation_mean":         texture_signals.get("saturation_mean"),
+                    "saturation_std":          texture_signals.get("saturation_std"),
+                    "exif_has_camera":         texture_signals.get("exif_has_camera"),
+                    "face_symmetry_score":     texture_signals.get("face_symmetry_score"),
+                    "skin_tone_variance":      texture_signals.get("skin_tone_variance"),
+                    "texture_lbp_hist":        texture_signals.get("texture_lbp_hist"),
+                },
                 "extracted_at":           datetime.now(timezone.utc).isoformat(),
             })
 
