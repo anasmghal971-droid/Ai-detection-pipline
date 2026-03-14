@@ -2,7 +2,7 @@
 // DETECT-AI: Image Scraper Worker (Stage 2)
 // Cloudflare Worker — Handles ALL image-based sources
 //
-// Sources: Unsplash, Pexels, Pixabay, Flickr CC, Wikimedia Commons
+// Sources: Unsplash, Pexels, Pixabay, Openverse (500M CC), NASA (300k public domain), Met Museum (470k CC0), Wikimedia Commons
 // ============================================================
 
 import type { Env, DetectAISample, SourceQueueItem } from "../../shared/types/index";
@@ -110,39 +110,6 @@ async function scrapePixabay(env: Env): Promise<Partial<DetectAISample>[]> {
   return samples;
 }
 
-// ── 4. Flickr Creative Commons ────────────────────────────────
-async function scrapeFlickr(env: Env): Promise<Partial<DetectAISample>[]> {
-  if (!env.FLICKR_API_KEY) return [];
-  // license=4 = CC BY, 5 = CC BY-SA, 7 = No known copyright
-  const url = `https://www.flickr.com/services/rest/?method=flickr.photos.search&api_key=${env.FLICKR_API_KEY}&license=4,5,7&sort=interestingness-desc&content_type=1&media=photos&format=json&nojsoncallback=1&per_page=100&extras=url_o,url_l,owner_name,date_taken,tags,description`;
-  const resp = await fetchWithRetry(url);
-  const data = await resp.json() as {
-    photos: {
-      photo: Array<{
-        id: string; owner: string; title: string;
-        url_o?: string; url_l?: string;
-        ownername?: string; datetaken?: string;
-        tags?: string; description?: { _content?: string };
-      }>;
-    };
-  };
-
-  return (data.photos?.photo ?? [])
-    .filter(p => p.url_o || p.url_l)
-    .map(p => ({
-      source_url:  `https://www.flickr.com/photos/${p.owner}/${p.id}`,
-      raw_content: p.url_o ?? p.url_l ?? "",
-      metadata: {
-        title:        p.title,
-        author:       p.ownername ?? p.owner,
-        publish_date: p.datetaken,
-        license:      "CC-BY-SA",
-        tags:         ["flickr", "cc", ...(p.tags?.split(" ") ?? [])],
-        description:  p.description?._content,
-      },
-    }));
-}
-
 // ── 5. Wikimedia Commons ──────────────────────────────────────
 async function scrapeWikimedia(_source: SourceQueueItem): Promise<Partial<DetectAISample>[]> {
   // Get random files from Wikimedia Commons
@@ -233,7 +200,9 @@ export default {
         case "unsplash":     rawSamples = await scrapeUnsplash(env);          break;
         case "pexels":       rawSamples = await scrapePexelsImages(env);      break;
         case "pixabay":      rawSamples = await scrapePixabay(env);           break;
-        case "flickr-cc":    rawSamples = await scrapeFlickr(env);            break;
+        case "openverse":    rawSamples = await scrapeOpenverse();            break;
+        case "nasa":          rawSamples = await scrapeNASA();                 break;
+        case "met-museum":    rawSamples = await scrapeMetMuseum();            break;
         case "wikimedia":    rawSamples = await scrapeWikimedia(source);      break;
         default:
           return new Response(JSON.stringify({ error: `Unknown image source: ${source.source_id}` }), { status: 400 });

@@ -77,7 +77,6 @@ jobs:
           UNSPLASH_ACCESS_KEY:  ${{ secrets.UNSPLASH_ACCESS_KEY }}
           PEXELS_API_KEY:       ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY:      ${{ secrets.PIXABAY_API_KEY }}
-          FLICKR_API_KEY:       ${{ secrets.FLICKR_API_KEY }}
 
   # ── 3. Video scraper ──────────────────────────────────────────
   # FIX: own directory → standard wrangler.toml → eliminates
@@ -183,7 +182,6 @@ jobs:
           UNSPLASH_ACCESS_KEY:  ${{ secrets.UNSPLASH_ACCESS_KEY }}
           PEXELS_API_KEY:       ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY:      ${{ secrets.PIXABAY_API_KEY }}
-          FLICKR_API_KEY:       ${{ secrets.FLICKR_API_KEY }}
           REDDIT_CLIENT_ID:     ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           UPSTASH_REDIS_URL:    ${{ secrets.UPSTASH_REDIS_URL }}
