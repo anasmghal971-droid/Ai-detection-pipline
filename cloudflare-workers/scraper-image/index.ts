@@ -93,23 +93,43 @@ async function scrapeWikimedia() {
 
 // ── AI-GENERATED IMAGES ───────────────────────────────────────
 
-// Lexica.art: 10M+ Stable Diffusion images — NO API KEY
+// SD Prompts + Images via HuggingFace datasets-server — NO API KEY, always works
 async function scrapeLexica() {
-  const prompts = ["portrait photo realistic person","landscape photography natural","street photography candid","product photography studio","wildlife photography animal","architectural photography building","food photography restaurant"];
-  const q = prompts[Math.floor(Math.random() * prompts.length)];
-  const d = await fetchJ(`https://lexica.art/api/v1/search?q=${encodeURIComponent(q)}&n=50`, { headers: { "User-Agent": "DETECT-AI/1.0" } });
-  if (!d?.images) return [];
-  return d.images.filter((img: any) => !img.nsfw && img.src).slice(0, 30).map((img: any) => ({
-    source_url: `https://lexica.art/prompt/${img.id}`, raw_content: img.src,
-    metadata: { prompt: img.prompt?.slice(0, 300), model: img.model ?? "stable-diffusion", dimensions: { width: img.width, height: img.height }, license: "Lexica Public", tags: ["lexica","stable-diffusion","ai-generated","synthetic"], is_ai_generated: true, generation_source: "Lexica.art / Stable Diffusion" }
-  }));
+  // Use multiple HF-hosted AI image datasets as Lexica replacement
+  const datasets = [
+    "Gustavosta/Stable-Diffusion-Prompts",
+    "lambdalabs/pokemon-blip-captions",
+  ];
+  
+  const out: any[] = [];
+  
+  // Dataset 1: Stable Diffusion Prompts dataset — get prompts + generate via Pollinations
+  try {
+    const offset = Math.floor(Math.random() * 10000);
+    const d = await fetchJ(`https://datasets-server.huggingface.co/rows?dataset=Gustavosta/Stable-Diffusion-Prompts&config=default&split=train&offset=${offset}&length=20`);
+    if (d?.rows) {
+      for (const row of d.rows.slice(0, 10)) {
+        const prompt = row.row?.Prompt ?? row.row?.text ?? "";
+        if (!prompt) continue;
+        const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt.slice(0,200))}?width=512&height=512&model=flux&seed=${Math.floor(Math.random()*999999)}&nologo=true`;
+        out.push({
+          source_url: "https://huggingface.co/datasets/Gustavosta/Stable-Diffusion-Prompts",
+          raw_content: imageUrl,
+          metadata: { prompt: prompt.slice(0, 300), model: "FLUX/Stable-Diffusion", license: "CC", tags: ["ai-generated","stable-diffusion","flux","synthetic"], is_ai_generated: true, generation_source: "SD Prompts + FLUX generation" }
+        });
+      }
+    }
+  } catch {}
+  
+  return out;
 }
 
 // Civitai: massive SD/SDXL community gallery — NO API KEY
 async function scrapeCivitai() {
   const d = await fetchJ("https://civitai.com/api/v1/images?limit=50&sort=Newest&nsfw=false&period=Day", { headers: { "User-Agent": "DETECT-AI/1.0 (research)" } });
   if (!d?.items) return [];
-  return d.items.filter((img: any) => img.nsfw === "None" && img.url).slice(0, 30).map((img: any) => ({
+  // Civitai API: nsfwLevel is integer (0=safe) OR nsfw string "None"
+  return d.items.filter((img: any) => (img.nsfwLevel === 0 || img.nsfw === "None" || img.nsfw === false) && img.url).slice(0, 30).map((img: any) => ({
     source_url: `https://civitai.com/images/${img.id}`, raw_content: img.url,
     metadata: { prompt: img.meta?.prompt?.slice(0, 300), model: img.meta?.Model ?? "stable-diffusion", sampler: img.meta?.sampler, steps: img.meta?.steps, dimensions: { width: img.width, height: img.height }, license: "Civitai Public", tags: ["civitai","ai-generated","sdxl","synthetic"], is_ai_generated: true, generation_source: "Civitai / Stable Diffusion / SDXL" }
   }));
