@@ -151,25 +151,32 @@ async function dispatchToScraper(
   // Map source_id to the correct service binding on env
   type Fetcher = { fetch: (url: string, init?: RequestInit) => Promise<Response> };
   const scraperMap: Record<string, Fetcher | undefined> = {
-    // Text sources
+    // Text sources — ALL mapped, NO gaps
     "bbc-news":        env.SCRAPER_TEXT,
     "reuters":         env.SCRAPER_TEXT,
+    "guardian":        env.SCRAPER_TEXT,
+    "nytimes":         env.SCRAPER_TEXT,
     "aljazeera":       env.SCRAPER_TEXT,
-    "arxiv":           env.SCRAPER_TEXT,
     "wikipedia":       env.SCRAPER_TEXT,
+    "arxiv":           env.SCRAPER_TEXT,
+    "npr":             env.SCRAPER_TEXT,
     "paperswithcode":  env.SCRAPER_TEXT,
-    "newsapi":         env.SCRAPER_TEXT,
     "stackexchange":   env.SCRAPER_TEXT,
     "reddit":          env.SCRAPER_TEXT,
     "worldbank":       env.SCRAPER_TEXT,
-    // Image sources
+    // REAL image sources
     "unsplash":        env.SCRAPER_IMAGE,
     "pexels":          env.SCRAPER_IMAGE,
     "pixabay":         env.SCRAPER_IMAGE,
-    "wikimedia":       env.SCRAPER_IMAGE,
     "openverse":       env.SCRAPER_IMAGE,
+    "wikimedia":       env.SCRAPER_IMAGE,
     "nasa":            env.SCRAPER_IMAGE,
     "met-museum":      env.SCRAPER_IMAGE,
+    // AI-GENERATED image sources — THE KEY ONES FOR DETECTION TRAINING
+    "lexica":          env.SCRAPER_IMAGE,
+    "civitai":         env.SCRAPER_IMAGE,
+    "pollinations":    env.SCRAPER_IMAGE,
+    "diffusiondb":     env.SCRAPER_IMAGE,
     // Video sources
     "pexels-video":    env.SCRAPER_VIDEO,
     "youtube":         env.SCRAPER_VIDEO,
