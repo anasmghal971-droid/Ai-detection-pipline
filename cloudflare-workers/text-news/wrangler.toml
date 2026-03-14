@@ -6,3 +6,5 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 PIPELINE_ENABLED = "true"
 WORKER_ID = "text-news-01"
+
+# Secrets: SUPABASE_URL, SUPABASE_SERVICE_KEY

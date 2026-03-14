@@ -6,3 +6,6 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 PIPELINE_ENABLED = "true"
 WORKER_ID = "scraper-image-01"
+
+# Secrets: SUPABASE_URL, SUPABASE_SERVICE_KEY,
+# UNSPLASH_ACCESS_KEY, PEXELS_API_KEY, PIXABAY_API_KEY

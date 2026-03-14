@@ -1,253 +1,199 @@
-// ============================================================
-// DETECT-AI: Image Scraper Worker (Stage 2)
-// Cloudflare Worker — Handles ALL image-based sources
-//
-// Sources: Unsplash, Pexels, Pixabay, Openverse (500M CC), NASA (300k public domain), Met Museum (470k CC0), Wikimedia Commons
-// ============================================================
+// DETECT-AI Image Scraper — COMPLETE REWRITE
+// TWO categories: REAL (HUMAN label) + AI-GENERATED (AI_GENERATED label)
+// AI sources: Lexica, Civitai, Pollinations, DiffusionDB
+// Real sources: Unsplash, Pexels, Pixabay, Openverse, NASA, Met, Wikimedia, LAION
 
-import type { Env, DetectAISample, SourceQueueItem } from "../../shared/types/index";
+import type { Env, DetectAISample } from "../../shared/types/index";
 import { createSupabaseClient } from "../dispatcher/supabase";
 import { PipelineLogger } from "../dispatcher/logger";
 
 function uuidv4(): string { return crypto.randomUUID(); }
 
-async function fetchWithRetry(url: string, options: RequestInit = {}, maxAttempts = 3): Promise<Response> {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const response = await fetch(url, options);
-    if (response.status === 429) throw Object.assign(new Error("Rate limited"), { rateLimited: true });
-    if (response.ok) return response;
-    if (attempt === maxAttempts) throw new Error(`HTTP ${response.status}: ${url}`);
-    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
-  }
-  throw new Error("Max retries exceeded");
-}
-
-// ── 1. Unsplash ───────────────────────────────────────────────
-async function scrapeUnsplash(env: Env): Promise<Partial<DetectAISample>[]> {
-  const resp = await fetchWithRetry(
-    "https://api.unsplash.com/photos/random?count=30&content_filter=high",
-    { headers: { Authorization: `Client-ID ${env.UNSPLASH_ACCESS_KEY}` } }
-  );
-  const photos = await resp.json() as Array<{
-    id: string; description?: string; alt_description?: string;
-    urls: { raw: string; full: string };
-    user: { name?: string; username?: string };
-    created_at: string; links: { html: string };
-    width: number; height: number;
-  }>;
-
-  return photos.map(p => ({
-    source_url:  p.links.html,
-    raw_content: p.urls.full, // Store full-res URL as content ref
-    metadata: {
-      title:        p.description ?? p.alt_description ?? `Unsplash photo ${p.id}`,
-      author:       p.user.name ?? p.user.username,
-      publish_date: p.created_at,
-      license:      "Unsplash-License",
-      dimensions:   { width: p.width, height: p.height },
-      tags:         ["unsplash", "photography"],
-    },
-  }));
-}
-
-// ── 2. Pexels Images ─────────────────────────────────────────
-async function scrapePexelsImages(env: Env): Promise<Partial<DetectAISample>[]> {
-  const resp = await fetchWithRetry(
-    "https://api.pexels.com/v1/curated?per_page=80",
-    { headers: { Authorization: env.PEXELS_API_KEY } }
-  );
-  const data = await resp.json() as {
-    photos: Array<{
-      id: number; url: string; photographer: string;
-      src: { original: string; large2x: string };
-      width: number; height: number; alt?: string;
-    }>;
-  };
-
-  return (data.photos ?? []).map(p => ({
-    source_url:  p.url,
-    raw_content: p.src.original, // Full-resolution URL
-    metadata: {
-      title:      p.alt ?? `Pexels photo ${p.id}`,
-      author:     p.photographer,
-      license:    "Pexels-License",
-      dimensions: { width: p.width, height: p.height },
-      tags:       ["pexels", "photography", "CC0"],
-    },
-  }));
-}
-
-// ── 3. Pixabay ────────────────────────────────────────────────
-async function scrapePixabay(env: Env): Promise<Partial<DetectAISample>[]> {
-  const langs = ["en", "de", "fr", "es", "zh", "ja", "ko", "pt", "it", "ru"];
-  const samples: Partial<DetectAISample>[] = [];
-
-  for (const lang of langs.slice(0, 3)) {
-    const url = `https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&image_type=photo&per_page=50&lang=${lang}&safesearch=true`;
-    const resp = await fetchWithRetry(url);
-    const data = await resp.json() as {
-      hits: Array<{
-        id: number; pageURL: string; webformatURL: string;
-        largeImageURL: string; imageWidth: number; imageHeight: number;
-        tags: string; user: string;
-      }>;
-    };
-
-    for (const hit of data.hits ?? []) {
-      samples.push({
-        source_url:  hit.pageURL,
-        raw_content: hit.largeImageURL,
-        metadata: {
-          title:      `Pixabay ${hit.id}`,
-          author:     hit.user,
-          license:    "Pixabay-License",
-          dimensions: { width: hit.imageWidth, height: hit.imageHeight },
-          tags:       ["pixabay", "CC0", ...hit.tags.split(",").map(t => t.trim())],
-        },
-      });
+async function fetchJ(url: string, opts: RequestInit = {}): Promise<any> {
+  for (let i = 1; i <= 3; i++) {
+    try {
+      const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(12000) });
+      if (r.status === 429) throw Object.assign(new Error("Rate limited"), { rateLimited: true });
+      if (r.ok) return await r.json();
+      if (i === 3) return null;
+      await new Promise(x => setTimeout(x, 1000 * i));
+    } catch (e: any) {
+      if (e.rateLimited) throw e;
+      if (i === 3) return null;
+      await new Promise(x => setTimeout(x, 1000 * i));
     }
   }
-  return samples;
+  return null;
 }
 
-// ── 5. Wikimedia Commons ──────────────────────────────────────
-async function scrapeWikimedia(_source: SourceQueueItem): Promise<Partial<DetectAISample>[]> {
-  // Get random files from Wikimedia Commons
-  const url = "https://commons.wikimedia.org/w/api.php?action=query&list=random&rnlimit=50&rnnamespace=6&format=json";
-  const resp = await fetchWithRetry(url);
-  const data = await resp.json() as {
-    query: { random: Array<{ id: number; title: string }> };
-  };
+// ── REAL PHOTOS ───────────────────────────────────────────────
+async function scrapeUnsplash(env: Env) {
+  const d = await fetchJ("https://api.unsplash.com/photos/random?count=30&content_filter=high", { headers: { Authorization: `Client-ID ${env.UNSPLASH_ACCESS_KEY}` } });
+  if (!d) return [];
+  return d.map((p: any) => ({ source_url: p.links.html, raw_content: p.urls.full, metadata: { title: p.description ?? p.alt_description, author: p.user?.name, license: "Unsplash", tags: ["unsplash","real-photo","human"], is_ai_generated: false } }));
+}
 
-  const samples: Partial<DetectAISample>[] = [];
+async function scrapePexels(env: Env) {
+  const d = await fetchJ("https://api.pexels.com/v1/curated?per_page=80", { headers: { Authorization: env.PEXELS_API_KEY } });
+  if (!d?.photos) return [];
+  return d.photos.map((p: any) => ({ source_url: p.url, raw_content: p.src.original, metadata: { title: p.alt ?? `Pexels ${p.id}`, author: p.photographer, license: "Pexels", tags: ["pexels","real-photo","cc0","human"], is_ai_generated: false } }));
+}
 
-  for (const file of (data.query.random ?? []).slice(0, 20)) {
-    const infoUrl = `https://commons.wikimedia.org/w/api.php?action=query&prop=imageinfo&iiprop=url|mime|size|extmetadata&pageids=${file.id}&format=json`;
-    const infoResp = await fetchWithRetry(infoUrl);
-    const infoData = await infoResp.json() as {
-      query: { pages: Record<string, {
-        imageinfo?: Array<{
-          url: string; mime: string; size: number;
-          extmetadata?: {
-            License?: { value?: string };
-            ImageDescription?: { value?: string };
-            Artist?: { value?: string };
-            DateTimeOriginal?: { value?: string };
-          };
-        }>;
-      }> };
-    };
-
-    const page = Object.values(infoData.query.pages)[0];
-    const info = page.imageinfo?.[0];
-    if (!info) continue;
-
-    // Only images (not video/audio — those go to video worker)
-    if (!info.mime.startsWith("image/")) continue;
-
-    const meta = info.extmetadata ?? {};
-    samples.push({
-      source_url:  `https://commons.wikimedia.org/?curid=${file.id}`,
-      raw_content: info.url,
-      metadata: {
-        title:        file.title.replace("File:", ""),
-        author:       meta.Artist?.value ? stripHtml(meta.Artist.value) : undefined,
-        publish_date: meta.DateTimeOriginal?.value,
-        license:      meta.License?.value ?? "Wikimedia-CC",
-        description:  meta.ImageDescription?.value
-          ? stripHtml(meta.ImageDescription.value).slice(0, 500) : undefined,
-        file_size_bytes: info.size,
-        tags:         ["wikimedia", "commons", "cc"],
-      },
-    });
+async function scrapePixabay(env: Env) {
+  const out: any[] = [];
+  for (const lang of ["en","de","es"]) {
+    const d = await fetchJ(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&image_type=photo&per_page=50&lang=${lang}&safesearch=true`);
+    if (d?.hits) for (const h of d.hits) out.push({ source_url: h.pageURL, raw_content: h.largeImageURL, metadata: { title: `Pixabay ${h.id}`, author: h.user, license: "Pixabay", tags: ["pixabay","cc0","real-photo","human"], is_ai_generated: false } });
   }
-  return samples;
+  return out;
 }
 
-function stripHtml(html: string): string {
-  return html.replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim();
+async function scrapeOpenverse() {
+  const topics = ["nature","people","city","animals","food","architecture"];
+  const q = topics[Math.floor(Math.random() * topics.length)];
+  const d = await fetchJ(`https://api.openverse.org/v1/images/?q=${q}&license_type=commercial,modification&page_size=40`, { headers: { "User-Agent": "DETECT-AI/1.0" } });
+  if (!d?.results) return [];
+  return d.results.map((img: any) => ({ source_url: img.foreign_landing_url, raw_content: img.url, metadata: { title: img.title, author: img.creator, license: img.license, tags: ["openverse","cc","real-photo","human"], is_ai_generated: false } }));
 }
 
-// ── Batch Push ────────────────────────────────────────────────
-async function batchPushToStaging(samples: DetectAISample[], env: Env): Promise<void> {
-  const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
-  const BATCH_SIZE = 100;
-  for (let i = 0; i < samples.length; i += BATCH_SIZE) {
-    const { error } = await db.from("samples_staging").insert(samples.slice(i, i + BATCH_SIZE));
-    if (error) console.error(JSON.stringify({ event: "STAGING_INSERT_ERROR", error }));
+async function scrapeNASA() {
+  const qs = ["earth","space","galaxy","astronaut","moon","mars","nebula","satellite"];
+  const q = qs[Math.floor(Math.random() * qs.length)];
+  const d = await fetchJ(`https://images-api.nasa.gov/search?q=${q}&media_type=image&page_size=20`);
+  if (!d?.collection?.items) return [];
+  return d.collection.items.filter((x: any) => x.links?.some((l: any) => l.rel === "preview")).map((item: any) => {
+    const m = item.data[0] ?? {};
+    return { source_url: `https://images.nasa.gov/details/${m.nasa_id}`, raw_content: item.links.find((l: any) => l.rel === "preview").href, metadata: { title: m.title, license: "Public Domain (US Gov)", tags: ["nasa","space","real-photo","human"], is_ai_generated: false } };
+  });
+}
+
+async function scrapeMetMuseum() {
+  const deptId = [11,12,13,14,15,16,17,18,19,21][Math.floor(Math.random() * 10)];
+  const list = await fetchJ(`https://collectionapi.metmuseum.org/public/collection/v1/objects?departmentIds=${deptId}&isHighlight=true`);
+  const ids = (list?.objectIDs ?? []).slice(0, 20);
+  const out: any[] = [];
+  await Promise.allSettled(ids.slice(0, 15).map(async (id: number) => {
+    const obj = await fetchJ(`https://collectionapi.metmuseum.org/public/collection/v1/objects/${id}`);
+    if (obj?.isPublicDomain && obj?.primaryImage) out.push({ source_url: obj.objectURL ?? `https://www.metmuseum.org/art/collection/search/${id}`, raw_content: obj.primaryImage, metadata: { title: obj.title, artist: obj.artistDisplayName, license: "CC0 1.0", tags: ["met-museum","art","real-photo","human"], is_ai_generated: false } });
+  }));
+  return out;
+}
+
+async function scrapeWikimedia() {
+  const d = await fetchJ("https://commons.wikimedia.org/w/api.php?action=query&list=random&rnlimit=30&rnnamespace=6&format=json");
+  const out: any[] = [];
+  await Promise.allSettled((d?.query?.random ?? []).slice(0, 15).map(async (f: any) => {
+    const info = await fetchJ(`https://commons.wikimedia.org/w/api.php?action=query&prop=imageinfo&iiprop=url|mime|extmetadata&pageids=${f.id}&format=json`);
+    const page = Object.values((info?.query?.pages ?? {}) as Record<string, any>)[0];
+    const i = page?.imageinfo?.[0];
+    if (i?.mime?.startsWith("image/")) out.push({ source_url: `https://commons.wikimedia.org/?curid=${f.id}`, raw_content: i.url, metadata: { title: f.title, license: i.extmetadata?.License?.value ?? "Wikimedia-CC", tags: ["wikimedia","cc","real-photo","human"], is_ai_generated: false } });
+  }));
+  return out;
+}
+
+// ── AI-GENERATED IMAGES ───────────────────────────────────────
+
+// Lexica.art: 10M+ Stable Diffusion images — NO API KEY
+async function scrapeLexica() {
+  const prompts = ["portrait photo realistic person","landscape photography natural","street photography candid","product photography studio","wildlife photography animal","architectural photography building","food photography restaurant"];
+  const q = prompts[Math.floor(Math.random() * prompts.length)];
+  const d = await fetchJ(`https://lexica.art/api/v1/search?q=${encodeURIComponent(q)}&n=50`, { headers: { "User-Agent": "DETECT-AI/1.0" } });
+  if (!d?.images) return [];
+  return d.images.filter((img: any) => !img.nsfw && img.src).slice(0, 30).map((img: any) => ({
+    source_url: `https://lexica.art/prompt/${img.id}`, raw_content: img.src,
+    metadata: { prompt: img.prompt?.slice(0, 300), model: img.model ?? "stable-diffusion", dimensions: { width: img.width, height: img.height }, license: "Lexica Public", tags: ["lexica","stable-diffusion","ai-generated","synthetic"], is_ai_generated: true, generation_source: "Lexica.art / Stable Diffusion" }
+  }));
+}
+
+// Civitai: massive SD/SDXL community gallery — NO API KEY
+async function scrapeCivitai() {
+  const d = await fetchJ("https://civitai.com/api/v1/images?limit=50&sort=Newest&nsfw=false&period=Day", { headers: { "User-Agent": "DETECT-AI/1.0 (research)" } });
+  if (!d?.items) return [];
+  return d.items.filter((img: any) => img.nsfw === "None" && img.url).slice(0, 30).map((img: any) => ({
+    source_url: `https://civitai.com/images/${img.id}`, raw_content: img.url,
+    metadata: { prompt: img.meta?.prompt?.slice(0, 300), model: img.meta?.Model ?? "stable-diffusion", sampler: img.meta?.sampler, steps: img.meta?.steps, dimensions: { width: img.width, height: img.height }, license: "Civitai Public", tags: ["civitai","ai-generated","sdxl","synthetic"], is_ai_generated: true, generation_source: "Civitai / Stable Diffusion / SDXL" }
+  }));
+}
+
+// Pollinations.ai: FLUX/SDXL generation — NO API KEY, always new unique images
+async function scrapePollinationsAI() {
+  const prompts = ["professional portrait photo person 8k photorealistic","landscape photography golden hour photorealistic","candid street photography urban","studio product photography white background","wildlife animal in natural habitat detailed photograph","modern building architectural photography exterior","food photography restaurant table detailed"];
+  const out: any[] = [];
+  for (const prompt of prompts.slice(0, 5)) {
+    const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&model=flux&seed=${Math.floor(Math.random()*999999)}&nologo=true`;
+    out.push({ source_url: "https://pollinations.ai", raw_content: imageUrl, metadata: { prompt, model: "FLUX", width: 1024, height: 1024, tags: ["pollinations","flux","ai-generated","synthetic"], is_ai_generated: true, generation_source: "Pollinations.ai / FLUX model" } });
   }
+  return out;
 }
 
-// ── Main Handler ──────────────────────────────────────────────
-interface ScraperRequest {
-  source: SourceQueueItem;
-  worker_id: string;
+// DiffusionDB: 14M labeled SD images via HF Datasets — NO API KEY
+async function scrapeDiffusionDB() {
+  const offset = Math.floor(Math.random() * 50000);
+  const d = await fetchJ(`https://datasets-server.huggingface.co/rows?dataset=poloclub/diffusiondb&config=2m_first_1k&split=train&offset=${offset}&length=30`);
+  if (!d?.rows) return [];
+  return d.rows.filter((r: any) => r.row?.image?.src).map((r: any) => ({
+    source_url: "https://huggingface.co/datasets/poloclub/diffusiondb", raw_content: r.row.image.src,
+    metadata: { prompt: r.row.prompt?.slice(0, 300), seed: r.row.seed, steps: r.row.step, sampler: r.row.sampler_name, model: "stable-diffusion", license: "CC BY 4.0", tags: ["diffusiondb","stable-diffusion","ai-generated","synthetic"], is_ai_generated: true, generation_source: "DiffusionDB / Stable Diffusion" }
+  }));
 }
 
+// ── MAIN ─────────────────────────────────────────────────────
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
-
-    const body = await request.json() as ScraperRequest;
-    const { source } = body;
+    const t0 = Date.now();
+    const { source } = await request.json() as { source: { source_id: string; source_url: string } };
     const logger = new PipelineLogger(env);
-    const startTime = Date.now();
 
     try {
-      let rawSamples: Partial<DetectAISample>[] = [];
+      let raw: any[] = [];
+      let label: "HUMAN" | "AI_GENERATED" = "HUMAN";
+      let confidence = 0.95;
 
       switch (source.source_id) {
-        case "unsplash":     rawSamples = await scrapeUnsplash(env);          break;
-        case "pexels":       rawSamples = await scrapePexelsImages(env);      break;
-        case "pixabay":      rawSamples = await scrapePixabay(env);           break;
-        case "openverse":    rawSamples = await scrapeOpenverse();            break;
-        case "nasa":          rawSamples = await scrapeNASA();                 break;
-        case "met-museum":    rawSamples = await scrapeMetMuseum();            break;
-        case "wikimedia":    rawSamples = await scrapeWikimedia(source);      break;
+        case "unsplash":     raw = await scrapeUnsplash(env);       label = "HUMAN"; break;
+        case "pexels":       raw = await scrapePexels(env);         label = "HUMAN"; break;
+        case "pixabay":      raw = await scrapePixabay(env);        label = "HUMAN"; break;
+        case "openverse":    raw = await scrapeOpenverse();         label = "HUMAN"; break;
+        case "nasa":         raw = await scrapeNASA();              label = "HUMAN"; break;
+        case "met-museum":   raw = await scrapeMetMuseum();         label = "HUMAN"; break;
+        case "wikimedia":    raw = await scrapeWikimedia();         label = "HUMAN"; break;
+        case "lexica":       raw = await scrapeLexica();            label = "AI_GENERATED"; confidence = 0.99; break;
+        case "civitai":      raw = await scrapeCivitai();           label = "AI_GENERATED"; confidence = 0.99; break;
+        case "pollinations": raw = await scrapePollinationsAI();    label = "AI_GENERATED"; confidence = 0.99; break;
+        case "diffusiondb":  raw = await scrapeDiffusionDB();       label = "AI_GENERATED"; confidence = 0.99; break;
         default:
-          return new Response(JSON.stringify({ error: `Unknown image source: ${source.source_id}` }), { status: 400 });
+          return new Response(JSON.stringify({ error: `Unknown source: ${source.source_id}` }), { status: 400 });
       }
 
-      const enriched: DetectAISample[] = rawSamples
-        .filter(s => s.raw_content && s.raw_content.length > 0)
-        .slice(0, 500)
-        .map(s => ({
-          sample_id:    uuidv4(),
-          source_id:    source.source_id,
-          source_url:   s.source_url ?? source.source_url,
-          content_type: "image" as const,
-          language:     "en",           // Images use metadata language
-          raw_content:  s.raw_content!,
-          storage_path: undefined,
-          metadata:     s.metadata ?? {},
-          scraped_at:   new Date().toISOString(),
-          worker_id:    env.WORKER_ID,
-          status:       "staged" as const,
+      const enriched: DetectAISample[] = raw
+        .filter((s: any) => s?.raw_content && s.raw_content.length > 5)
+        .slice(0, 300)
+        .map((s: any) => ({
+          sample_id: uuidv4(), source_id: source.source_id, source_url: s.source_url ?? source.source_url,
+          content_type: "image" as const, language: "en", raw_content: s.raw_content,
+          label, final_confidence: confidence, verified: label === "AI_GENERATED",
+          metadata: s.metadata ?? {}, scraped_at: new Date().toISOString(),
+          worker_id: env.WORKER_ID ?? "scraper-image-01", status: "staged" as const,
         }));
 
-      await batchPushToStaging(enriched, env);
-
-      const duration = Date.now() - startTime;
-      logger.log("SCRAPE_COMPLETE", {
-        source_id: source.source_id,
-        sample_count: enriched.length,
-        duration_ms: duration,
-      });
-      await logger.flush();
-
-      return new Response(
-        JSON.stringify({ samples_scraped: enriched.length, duration_ms: duration }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
-      );
-
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.log("SCRAPE_ERROR", { source_id: source.source_id, error_message: errorMsg });
-      await logger.flush();
-      if ((err as { rateLimited?: boolean }).rateLimited) {
-        return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429 });
+      const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
+      let pushed = 0;
+      for (let i = 0; i < enriched.length; i += 100) {
+        const { error } = await db.from("samples_staging").insert(enriched.slice(i, i + 100));
+        if (!error) pushed += Math.min(100, enriched.length - i);
+        else logger.log("INSERT_ERROR", { source_id: source.source_id, error_message: JSON.stringify(error) });
       }
-      return new Response(JSON.stringify({ error: errorMsg }), { status: 500 });
+
+      logger.log("SCRAPE_COMPLETE", { source_id: source.source_id, sample_count: pushed, duration_ms: Date.now() - t0 });
+      await logger.flush();
+      return new Response(JSON.stringify({ samples_scraped: pushed, label, duration_ms: Date.now() - t0 }), { status: 200, headers: { "Content-Type": "application/json" } });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      logger.log("SCRAPE_ERROR", { source_id: source.source_id, error_message: msg });
+      await logger.flush();
+      if (err.rateLimited) return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429 });
+      return new Response(JSON.stringify({ error: msg }), { status: 500 });
     }
   },
 };

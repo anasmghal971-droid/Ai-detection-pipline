@@ -6,3 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 PIPELINE_ENABLED = "true"
 WORKER_ID = "scraper-text-01"
+
+# Secrets set via GitHub Actions (wrangler secret put):
+# SUPABASE_URL, SUPABASE_SERVICE_KEY, NEWSAPI_KEY,
+# REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET

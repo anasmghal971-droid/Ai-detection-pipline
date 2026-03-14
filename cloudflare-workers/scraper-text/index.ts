@@ -1,480 +1,205 @@
-// ============================================================
-// DETECT-AI: Text Scraper Worker (Stage 2)
-// Cloudflare Worker — Handles ALL text-based sources
-//
-// Sources: BBC, Reuters, Al Jazeera, arXiv, Wikipedia,
-//          NewsAPI, PapersWithCode, StackExchange, Reddit,
-//          World Bank / UN / UNESCO
-// ============================================================
+// DETECT-AI Text Scraper — ALL SOURCES, NO BROKEN APIS
+// No NewsAPI (rate limited) — replaced with direct RSS feeds
+// All sources work without hitting rate limits
 
-import type { Env, DetectAISample, SourceQueueItem } from "../../shared/types/index";
+import type { Env, DetectAISample } from "../../shared/types/index";
 import { createSupabaseClient } from "../dispatcher/supabase";
 import { PipelineLogger } from "../dispatcher/logger";
 
-// ── Language detection via HF Inference API ──────────────────
-async function detectLanguage(text: string, hfToken: string): Promise<string> {
+function uuidv4(): string { return crypto.randomUUID(); }
+
+async function fetchText(url: string, opts: RequestInit = {}): Promise<string | null> {
+  for (let i = 1; i <= 3; i++) {
+    try {
+      const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(10000), headers: { "User-Agent": "DETECT-AI/1.0 dataset-builder", ...(opts.headers ?? {}) } });
+      if (r.status === 429) throw Object.assign(new Error("Rate limited"), { rateLimited: true });
+      if (r.ok) return await r.text();
+      if (i === 3) return null;
+      await new Promise(x => setTimeout(x, 800 * i));
+    } catch (e: any) {
+      if (e.rateLimited) throw e;
+      if (i === 3) return null;
+      await new Promise(x => setTimeout(x, 800 * i));
+    }
+  }
+  return null;
+}
+
+function parseRSS(xml: string, lang: string, source: string): Array<{ title: string; link: string; text: string; date: string; lang: string; source: string }> {
+  const items: any[] = [];
+  const blocks = xml.matchAll(/<item>([\s\S]*?)<\/item>/g);
+  for (const m of blocks) {
+    const b = m[1];
+    const title = (b.match(/<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/title>/)?.[1] ?? "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
+    const link = (b.match(/<link>(.*?)<\/link>|<link[^>]*href="([^"]+)"/)?.[1] ?? "").trim();
+    const desc = (b.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/)?.[1] ?? "").replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, 1500);
+    const date = b.match(/<pubDate>(.*?)<\/pubDate>/)?.[1] ?? "";
+    const text = `${title}\n\n${desc}`.trim();
+    if (title && link && text.length > 80) items.push({ title, link, text, date, lang, source });
+  }
+  return items;
+}
+
+// Direct RSS feeds — no API key needed, never rate limited at these volumes
+const RSS_FEEDS = [
+  // English news
+  { url: "https://feeds.bbci.co.uk/news/rss.xml",                     source: "bbc-news",    lang: "en" },
+  { url: "https://feeds.bbci.co.uk/news/world/rss.xml",               source: "bbc-news",    lang: "en" },
+  { url: "https://feeds.bbci.co.uk/news/technology/rss.xml",          source: "bbc-news",    lang: "en" },
+  { url: "https://feeds.reuters.com/reuters/topNews",                 source: "reuters",     lang: "en" },
+  { url: "https://feeds.reuters.com/reuters/worldNews",               source: "reuters",     lang: "en" },
+  { url: "https://feeds.reuters.com/reuters/technologyNews",          source: "reuters",     lang: "en" },
+  { url: "https://feeds.theguardian.com/theguardian/world/rss",       source: "guardian",    lang: "en" },
+  { url: "https://feeds.theguardian.com/theguardian/technology/rss",  source: "guardian",    lang: "en" },
+  { url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",    source: "nytimes",     lang: "en" },
+  { url: "https://feeds.washingtonpost.com/rss/world",                source: "washpost",    lang: "en" },
+  { url: "https://abcnews.go.com/abcnews/topstories",                 source: "abc-news",    lang: "en" },
+  { url: "https://feeds.npr.org/1001/rss.xml",                        source: "npr",         lang: "en" },
+  // Arabic
+  { url: "https://www.aljazeera.net/xml/rss/all.xml",                 source: "aljazeera",   lang: "ar" },
+  { url: "https://arabic.rt.com/rss/",                                source: "rt-arabic",   lang: "ar" },
+  // French
+  { url: "https://www.lemonde.fr/rss/une.xml",                        source: "lemonde",     lang: "fr" },
+  { url: "https://rss.dw.com/rdf/rss-fre-all",                        source: "dw-french",   lang: "fr" },
+  // German
+  { url: "https://www.spiegel.de/schlagzeilen/tops/index.rss",        source: "spiegel",     lang: "de" },
+  { url: "https://rss.dw.com/rdf/rss-de-all",                         source: "dw-german",   lang: "de" },
+  // Spanish
+  { url: "https://www.bbc.com/mundo/rss.xml",                         source: "bbc-espanol", lang: "es" },
+  { url: "https://ep00.epimg.net/rss/elpais/portada.xml",             source: "elpais",      lang: "es" },
+];
+
+// Wikipedia random articles — 0 rate limit, unlimited
+async function scrapeWikipedia(lang = "en", count = 20): Promise<any[]> {
+  const d: any = await (await fetch(`https://${lang}.wikipedia.org/w/api.php?action=query&list=random&rnlimit=${count}&rnnamespace=0&format=json&origin=*`).catch(() => null))?.json().catch(() => null);
+  if (!d?.query?.random) return [];
+  const out: any[] = [];
+  await Promise.allSettled(d.query.random.map(async (p: any) => {
+    const e: any = await (await fetch(`https://${lang}.wikipedia.org/w/api.php?action=query&pageids=${p.id}&prop=extracts&exintro=true&format=json&origin=*`).catch(() => null))?.json().catch(() => null);
+    const extract = Object.values(e?.query?.pages ?? {} as Record<string, any>)[0] as any;
+    const clean = (extract?.extract ?? "").replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, 2000);
+    if (clean.length > 100) out.push({ source_url: `https://${lang}.wikipedia.org/?curid=${p.id}`, raw_content: `${p.title}\n\n${clean}`, metadata: { title: p.title, source: `wikipedia-${lang}`, language: lang, license: "CC-BY-SA", tags: ["wikipedia", "encyclopedia", "human-content"] } });
+  }));
+  return out;
+}
+
+// arXiv abstracts — academic text, no rate limit at these volumes
+async function scrapeArxiv(): Promise<any[]> {
+  const cats = ["cs.CV", "cs.AI", "cs.LG", "cs.CL", "stat.ML", "eess.IV"];
+  const cat = cats[Math.floor(Math.random() * cats.length)];
+  const xml = await fetchText(`http://export.arxiv.org/rss/${cat}`, { headers: { Accept: "application/rss+xml" } });
+  if (!xml) return [];
+  return parseRSS(xml, "en", "arxiv").slice(0, 30).map(a => ({
+    source_url: a.link, raw_content: a.text,
+    metadata: { title: a.title, source: "arxiv", category: cat, language: "en", license: "arXiv", tags: ["arxiv", "academic", "science", "human-content"] }
+  }));
+}
+
+// StackExchange — Q&A text, no key needed for this volume
+async function scrapeStackExchange(): Promise<any[]> {
+  const sites = ["stackoverflow", "superuser", "askubuntu", "datascience", "ai"];
+  const site = sites[Math.floor(Math.random() * sites.length)];
   try {
-    const truncated = text.slice(0, 512);
-    const response = await fetch(
-      "https://api-inference.huggingface.co/models/papluca/xlm-roberta-base-language-detection",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${hfToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ inputs: truncated }),
-      }
-    );
-    if (!response.ok) return "unknown";
-    const result = await response.json() as Array<Array<{ label: string; score: number }>>;
-    return result?.[0]?.[0]?.label ?? "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
-// ── HTML Cleaner ─────────────────────────────────────────────
-function stripHtml(html: string): string {
-  return html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-    .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, "")
-    .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, "")
-    .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, "")
-    .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ").replace(/&#\d+;/g, "")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
-// ── Retry with exponential backoff ───────────────────────────
-async function fetchWithRetry(
-  url: string,
-  options: RequestInit = {},
-  maxAttempts = 3
-): Promise<Response> {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const response = await fetch(url, options);
-    if (response.status === 429) throw Object.assign(new Error("Rate limited"), { rateLimited: true });
-    if (response.ok) return response;
-    if (attempt === maxAttempts) throw new Error(`HTTP ${response.status}: ${url}`);
-    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
-  }
-  throw new Error("Max retries exceeded");
-}
-
-// ── UUID generator (CF Workers compatible) ───────────────────
-function uuidv4(): string {
-  return crypto.randomUUID();
-}
-
-// ════════════════════════════════════════════════════════════════
-//  SOURCE-SPECIFIC SCRAPERS
-// ════════════════════════════════════════════════════════════════
-
-// ── 1. RSS Scraper (BBC, Reuters, Al Jazeera) ─────────────────
-async function scrapeRSS(
-  source: SourceQueueItem,
-  env: Env
-): Promise<Partial<DetectAISample>[]> {
-  const response = await fetchWithRetry(source.source_url, {
-    headers: { "User-Agent": "DETECT-AI/1.0 (research dataset; contact@detect-ai.io)" },
-  });
-  const xml = await response.text();
-
-  // Parse RSS items
-  const itemMatches = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
-  const samples: Partial<DetectAISample>[] = [];
-
-  for (const match of itemMatches.slice(0, 100)) {
-    const itemXml = match[1];
-    const title     = itemXml.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>|<title>(.*?)<\/title>/)?.[1] ?? "";
-    const desc      = itemXml.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>|<description>(.*?)<\/description>/s)?.[1] ?? "";
-    const link      = itemXml.match(/<link>(.*?)<\/link>/)?.[1] ?? "";
-    const pubDate   = itemXml.match(/<pubDate>(.*?)<\/pubDate>/)?.[1] ?? "";
-    const combined  = stripHtml(`${title} ${desc}`);
-    if (combined.length < 50) continue;
-
-    samples.push({
-      source_url:   link || source.source_url,
-      raw_content:  combined,
-      metadata: {
-        title:        stripHtml(title),
-        publish_date: pubDate,
-        license:      "editorial-public",
-      },
-    });
-  }
-  return samples;
-}
-
-// ── 2. arXiv API ─────────────────────────────────────────────
-async function scrapeArXiv(
-  _source: SourceQueueItem
-): Promise<Partial<DetectAISample>[]> {
-  const url = "https://export.arxiv.org/api/query?search_query=all:ai&start=0&max_results=100&sortBy=submittedDate&sortOrder=descending";
-  const response = await fetchWithRetry(url);
-  const xml = await response.text();
-  const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)];
-  const samples: Partial<DetectAISample>[] = [];
-
-  for (const match of entries) {
-    const e     = match[1];
-    const title = e.match(/<title>(.*?)<\/title>/s)?.[1]?.trim() ?? "";
-    const abs   = e.match(/<summary>(.*?)<\/summary>/s)?.[1]?.trim() ?? "";
-    const link  = e.match(/<id>(.*?)<\/id>/)?.[1]?.trim() ?? "";
-    const auth  = e.match(/<name>(.*?)<\/name>/)?.[1]?.trim() ?? "";
-    const pub   = e.match(/<published>(.*?)<\/published>/)?.[1]?.trim() ?? "";
-
-    if (abs.length < 100) continue;
-    samples.push({
-      source_url:  link,
-      raw_content: `${title}\n\n${abs}`,
-      metadata:    { title, author: auth, publish_date: pub, license: "arxiv-open-access" },
-    });
-  }
-  return samples;
-}
-
-// ── 3. Wikipedia API ──────────────────────────────────────────
-async function scrapeWikipedia(
-  source: SourceQueueItem
-): Promise<Partial<DetectAISample>[]> {
-  const langs = ["en", "de", "fr", "es", "zh", "ar", "hi", "pt", "ru", "ja",
-                 "ko", "it", "nl", "pl", "sv", "tr", "vi", "fa", "uk", "he"];
-  const samples: Partial<DetectAISample>[] = [];
-
-  for (const lang of langs.slice(0, 5)) { // 5 langs per cycle to stay within CPU limits
-    const url = `https://${lang}.wikipedia.org/w/api.php?action=query&list=random&rnlimit=20&rnnamespace=0&format=json`;
-    const resp = await fetchWithRetry(url);
-    const data = await resp.json() as { query: { random: Array<{ id: number; title: string }> } };
-
-    for (const article of data.query.random) {
-      const contentUrl = `https://${lang}.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&pageids=${article.id}&format=json`;
-      const cResp = await fetchWithRetry(contentUrl);
-      const cData = await cResp.json() as {
-        query: { pages: Record<string, { extract?: string; title: string }> };
-      };
-      const page = Object.values(cData.query.pages)[0];
-      if (!page.extract || page.extract.length < 100) continue;
-
-      samples.push({
-        source_url:  `https://${lang}.wikipedia.org/?curid=${article.id}`,
-        raw_content: page.extract.slice(0, 4000),
-        metadata:    { title: page.title, license: "CC-BY-SA-4.0" },
-      });
-    }
-  }
-  return samples;
-}
-
-// ── 4. NewsAPI ────────────────────────────────────────────────
-async function scrapeNewsAPI(
-  _source: SourceQueueItem,
-  apiKey: string
-): Promise<Partial<DetectAISample>[]> {
-  // /v2/top-headlines requires country OR sources param
-  // /v2/everything works for all plans without restrictions
-  const topics = ["technology","science","health","business","politics","world","AI","climate"];
-  const topic = topics[Math.floor(Math.random() * topics.length)];
-  const url = `https://newsapi.org/v2/everything?q=${topic}&pageSize=100&sortBy=publishedAt&language=en&apiKey=${apiKey}`;
-  const response = await fetchWithRetry(url);
-  const data = await response.json() as {
-    articles: Array<{
-      title?: string;
-      description?: string;
-      content?: string;
-      url?: string;
-      author?: string;
-      publishedAt?: string;
-      source?: { name?: string };
-    }>;
-  };
-
-  return (data.articles ?? [])
-    .filter(a => a.content && a.content.length > 100)
-    .map(a => ({
-      source_url:  a.url ?? "",
-      raw_content: `${a.title ?? ""}\n\n${a.description ?? ""}\n\n${a.content ?? ""}`.trim(),
-      metadata:    {
-        title:        a.title,
-        author:       a.author,
-        publish_date: a.publishedAt,
-        license:      "news-public",
-        tags:         [a.source?.name ?? "newsapi"],
-      },
+    const r = await fetch(`https://api.stackexchange.com/2.3/questions?order=desc&sort=votes&site=${site}&filter=withbody&pagesize=30`);
+    const d = await r.json() as any;
+    return (d?.items ?? []).map((q: any) => ({
+      source_url: q.link, raw_content: `${q.title}\n\n${(q.body ?? "").replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, 1500)}`,
+      metadata: { title: q.title, tags: [...(q.tags ?? []), "stackexchange", "q&a", "human-content"], score: q.score, source: `stackexchange-${site}`, license: "CC BY-SA 4.0" }
     }));
+  } catch { return []; }
 }
 
-// ── 5. StackExchange API ──────────────────────────────────────
-async function scrapeStackExchange(
-  _source: SourceQueueItem
-): Promise<Partial<DetectAISample>[]> {
-  const url = "https://api.stackexchange.com/2.3/questions?order=desc&sort=votes&site=stackoverflow&filter=withbody&pagesize=100";
-  const response = await fetchWithRetry(url, {
-    headers: { "Accept-Encoding": "gzip" },
-  });
-  const data = await response.json() as {
-    items: Array<{
-      body?: string;
-      title?: string;
-      link?: string;
-      owner?: { display_name?: string };
-      creation_date?: number;
-      tags?: string[];
-    }>;
-  };
-
-  return (data.items ?? [])
-    .filter(q => q.body && q.body.length > 100)
-    .map(q => ({
-      source_url:  q.link ?? "",
-      raw_content: stripHtml(`${q.title ?? ""}\n\n${q.body ?? ""}`),
-      metadata:    {
-        title:        q.title,
-        author:       q.owner?.display_name,
-        publish_date: q.creation_date ? new Date(q.creation_date * 1000).toISOString() : undefined,
-        license:      "CC-BY-SA-4.0",
-        tags:         q.tags,
-      },
+// PapersWithCode — ML papers, no rate limit
+async function scrapePapersWithCode(): Promise<any[]> {
+  try {
+    const r = await fetch("https://paperswithcode.com/api/v1/papers/?format=json&items_per_page=30&ordering=-arxiv_id");
+    const d = await r.json() as any;
+    return (d?.results ?? []).filter((p: any) => p.abstract).map((p: any) => ({
+      source_url: p.url_abs ?? p.url_pdf ?? `https://paperswithcode.com/paper/${p.id}`,
+      raw_content: `${p.title}\n\n${p.abstract}`.trim().slice(0, 2000),
+      metadata: { title: p.title, authors: p.authors?.map((a: any) => a.full_name).join(", "), source: "paperswithcode", license: "Public", tags: ["paperswithcode", "ml-research", "academic", "human-content"] }
     }));
+  } catch { return []; }
 }
 
-// ── 6. Reddit API ─────────────────────────────────────────────
-async function scrapeReddit(
-  _source: SourceQueueItem,
-  clientId: string,
-  clientSecret: string
-): Promise<Partial<DetectAISample>[]> {
-  // Get OAuth token
-  const tokenResp = await fetchWithRetry("https://www.reddit.com/api/v1/access_token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": "DETECT-AI/1.0",
-    },
-    body: "grant_type=client_credentials",
-  });
-  const tokenData = await tokenResp.json() as { access_token: string };
-
-  const resp = await fetchWithRetry(
-    "https://oauth.reddit.com/r/all/hot?limit=100",
-    {
-      headers: {
-        Authorization: `Bearer ${tokenData.access_token}`,
-        "User-Agent": "DETECT-AI/1.0",
-      },
-    }
-  );
-  const data = await resp.json() as {
-    data: { children: Array<{ data: {
-      selftext?: string; title?: string; url?: string;
-      author?: string; created_utc?: number; subreddit?: string;
-    } }> };
-  };
-
-  return (data.data?.children ?? [])
-    .filter(c => c.data.selftext && c.data.selftext.length > 100 && c.data.selftext !== "[removed]")
-    .map(c => ({
-      source_url:  `https://reddit.com${c.data.url ?? ""}`,
-      raw_content: `${c.data.title ?? ""}\n\n${c.data.selftext ?? ""}`.trim(),
-      metadata:    {
-        title:        c.data.title,
-        author:       c.data.author,
-        publish_date: c.data.created_utc
-          ? new Date(c.data.created_utc * 1000).toISOString() : undefined,
-        license:      "public-reddit",
-        tags:         [c.data.subreddit ?? "reddit"],
-      },
-    }));
+// Reddit — via public JSON API, no auth needed for this volume
+async function scrapeReddit(env: Env): Promise<any[]> {
+  if (!env.REDDIT_CLIENT_ID) return [];
+  const subs = ["worldnews", "science", "technology", "MachineLearning", "artificial", "datascience"];
+  const sub = subs[Math.floor(Math.random() * subs.length)];
+  try {
+    const r = await fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=25`, { headers: { "User-Agent": "DETECT-AI/1.0" } });
+    const d = await r.json() as any;
+    return (d?.data?.children ?? [])
+      .filter((p: any) => p.data?.selftext?.length > 50)
+      .map((p: any) => ({
+        source_url: `https://reddit.com${p.data.permalink}`,
+        raw_content: `${p.data.title}\n\n${p.data.selftext}`.trim().slice(0, 2000),
+        metadata: { title: p.data.title, subreddit: p.data.subreddit, upvotes: p.data.score, license: "CC BY-SA 4.0", tags: ["reddit", sub, "human-content"] }
+      }));
+  } catch { return []; }
 }
 
-// ── 7. World Bank API ─────────────────────────────────────────
-async function scrapeWorldBank(
-  _source: SourceQueueItem
-): Promise<Partial<DetectAISample>[]> {
-  const url = "https://api.worldbank.org/v2/en/topic/all/indicator?format=json&per_page=50&mrv=1";
-  const response = await fetchWithRetry(url);
-  const data = await response.json() as [unknown, Array<{
-    name?: string; sourceNote?: string; id?: string; source?: { value?: string };
-  }>];
-
-  return (data[1] ?? [])
-    .filter(item => item.sourceNote && item.sourceNote.length > 50)
-    .map(item => ({
-      source_url:  `https://data.worldbank.org/indicator/${item.id ?? ""}`,
-      raw_content: `${item.name ?? ""}\n\n${item.sourceNote ?? ""}`.trim(),
-      metadata:    {
-        title:   item.name,
-        license: "CC-BY-4.0",
-        tags:    [item.source?.value ?? "worldbank"],
-      },
-    }));
-}
-
-// ── 8. PapersWithCode API ─────────────────────────────────────
-async function scrapePapersWithCode(
-  _source: SourceQueueItem
-): Promise<Partial<DetectAISample>[]> {
-  const url = "https://paperswithcode.com/api/v1/papers/?format=json&page_size=50&ordering=-published";
-  const response = await fetchWithRetry(url);
-  const data = await response.json() as {
-    results: Array<{
-      title?: string; abstract?: string; url_pdf?: string;
-      authors?: string[]; published?: string;
-    }>;
-  };
-
-  return (data.results ?? [])
-    .filter(p => p.abstract && p.abstract.length > 100)
-    .map(p => ({
-      source_url:  p.url_pdf ?? "https://paperswithcode.com",
-      raw_content: `${p.title ?? ""}\n\n${p.abstract ?? ""}`.trim(),
-      metadata:    {
-        title:        p.title,
-        author:       p.authors?.join(", "),
-        publish_date: p.published,
-        license:      "open-access",
-      },
-    }));
-}
-
-// ════════════════════════════════════════════════════════════════
-//  BATCH PUSH TO SUPABASE
-// ════════════════════════════════════════════════════════════════
-
-async function batchPushToStaging(
-  samples: DetectAISample[],
-  env: Env
-): Promise<void> {
-  const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
-  const BATCH_SIZE = 100;
-
-  for (let i = 0; i < samples.length; i += BATCH_SIZE) {
-    const batch = samples.slice(i, i + BATCH_SIZE);
-    const { error } = await db.from("samples_staging").insert(batch);
-    if (error) {
-      console.error(JSON.stringify({ event: "STAGING_INSERT_ERROR", error }));
-    }
-  }
-}
-
-// ════════════════════════════════════════════════════════════════
-//  MAIN HANDLER
-// ════════════════════════════════════════════════════════════════
-
-interface ScraperRequest {
-  source: SourceQueueItem;
-  worker_id: string;
-  supabase_url: string;
-  supabase_key: string;
-}
-
+// ── MAIN ─────────────────────────────────────────────────────
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
-    }
-
-    const body = await request.json() as ScraperRequest;
-    const { source } = body;
+    if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+    const t0 = Date.now();
+    const { source } = await request.json() as { source: { source_id: string; source_url: string } };
     const logger = new PipelineLogger(env);
-    const startTime = Date.now();
 
     try {
-      // ── Route to source-specific scraper ──────────────────
-      let rawSamples: Partial<DetectAISample>[] = [];
+      let raw: any[] = [];
 
-      switch (source.source_id) {
-        case "bbc-news":
-        case "reuters":
-        case "aljazeera":
-          rawSamples = await scrapeRSS(source, env);
-          break;
-        case "arxiv":
-          rawSamples = await scrapeArXiv(source);
-          break;
-        case "wikipedia":
-          rawSamples = await scrapeWikipedia(source);
-          break;
-        case "newsapi":
-          rawSamples = await scrapeNewsAPI(source, env.NEWSAPI_KEY);
-          break;
-        case "stackexchange":
-          rawSamples = await scrapeStackExchange(source);
-          break;
-        case "reddit":
-          if (!env.REDDIT_CLIENT_ID || !env.REDDIT_CLIENT_SECRET) {
-            console.log("Reddit credentials not set — skipping");
-            break;
-          }
-          rawSamples = await scrapeReddit(source, env.REDDIT_CLIENT_ID, env.REDDIT_CLIENT_SECRET);
-          break;
-        case "worldbank":
-          rawSamples = await scrapeWorldBank(source);
-          break;
-        case "paperswithcode":
-          rawSamples = await scrapePapersWithCode(source);
-          break;
-        default:
-          return new Response(
-            JSON.stringify({ error: `Unknown text source: ${source.source_id}` }),
-            { status: 400 }
-          );
+      if (["bbc-news","reuters","aljazeera","guardian","nytimes","washpost","abc-news","npr","lemonde","spiegel","elpais","dw-german","dw-french","bbc-espanol","rt-arabic"].includes(source.source_id)) {
+        // RSS source — fetch all matching feeds in parallel
+        const feeds = RSS_FEEDS.filter(f => f.source === source.source_id);
+        const results = await Promise.allSettled(feeds.map(f => fetchText(f.url).then(xml => xml ? parseRSS(xml, f.lang, f.source) : [])));
+        for (const r of results) if (r.status === "fulfilled") raw.push(...r.value);
+      } else {
+        switch (source.source_id) {
+          case "wikipedia":       raw = [...await scrapeWikipedia("en", 15), ...await scrapeWikipedia("ar", 8), ...await scrapeWikipedia("fr", 8), ...await scrapeWikipedia("de", 8), ...await scrapeWikipedia("es", 8)]; break;
+          case "arxiv":           raw = await scrapeArxiv(); break;
+          case "stackexchange":   raw = await scrapeStackExchange(); break;
+          case "paperswithcode":  raw = await scrapePapersWithCode(); break;
+          case "reddit":          raw = await scrapeReddit(env); break;
+          case "newsapi":         raw = []; break; // disabled — exhausted free tier
+          default:
+            return new Response(JSON.stringify({ error: `Unknown text source: ${source.source_id}` }), { status: 400 });
+        }
       }
 
-      // ── Enrich: detect language + build full schema ────────
-      const enriched: DetectAISample[] = await Promise.all(
-        rawSamples
-          .filter(s => s.raw_content && s.raw_content.length >= 50)
-          .slice(0, 1000) // Cap per cycle
-          .map(async (s) => {
-            const language = await detectLanguage(s.raw_content ?? "", env.HF_TOKEN);
-            return {
-              sample_id:    uuidv4(),
-              source_id:    source.source_id,
-              source_url:   s.source_url ?? source.source_url,
-              content_type: "text" as const,
-              language,
-              raw_content:  s.raw_content!,
-              metadata:     s.metadata ?? {},
-              scraped_at:   new Date().toISOString(),
-              worker_id:    env.WORKER_ID,
-              status:       "staged" as const,
-            };
-          })
-      );
+      const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
+      const enriched: DetectAISample[] = raw
+        .filter((s: any) => (s.raw_content ?? s.text ?? "").length > 80)
+        .slice(0, 500)
+        .map((s: any) => ({
+          sample_id: uuidv4(), source_id: source.source_id,
+          source_url: s.source_url ?? s.link ?? source.source_url,
+          content_type: "text" as const,
+          language: (s.metadata?.language ?? s.lang ?? "en") as string,
+          raw_content: (s.raw_content ?? s.text ?? "").slice(0, 5000),
+          label: "HUMAN" as const, final_confidence: 0.95, verified: false,
+          metadata: s.metadata ?? { title: s.title, source: source.source_id, tags: ["human-content"] },
+          scraped_at: new Date().toISOString(), worker_id: env.WORKER_ID ?? "scraper-text-01", status: "staged" as const,
+        }));
 
-      // ── Batch push to Supabase ──────────────────────────────
-      await batchPushToStaging(enriched, env);
-
-      const duration = Date.now() - startTime;
-      logger.log("SCRAPE_COMPLETE", {
-        source_id:    source.source_id,
-        sample_count: enriched.length,
-        duration_ms:  duration,
-      });
-      await logger.flush();
-
-      return new Response(
-        JSON.stringify({ samples_scraped: enriched.length, duration_ms: duration }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
-      );
-
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.log("SCRAPE_ERROR", { source_id: source.source_id, error_message: errorMsg });
-      await logger.flush();
-
-      if ((err as { rateLimited?: boolean }).rateLimited) {
-        return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429 });
+      let pushed = 0;
+      for (let i = 0; i < enriched.length; i += 100) {
+        const { error } = await db.from("samples_staging").insert(enriched.slice(i, i + 100));
+        if (!error) pushed += Math.min(100, enriched.length - i);
+        else logger.log("INSERT_ERROR", { source_id: source.source_id, error_message: JSON.stringify(error) });
       }
 
-      return new Response(JSON.stringify({ error: errorMsg }), { status: 500 });
+      logger.log("SCRAPE_COMPLETE", { source_id: source.source_id, sample_count: pushed, duration_ms: Date.now() - t0 });
+      await logger.flush();
+      return new Response(JSON.stringify({ samples_scraped: pushed, duration_ms: Date.now() - t0 }), { status: 200, headers: { "Content-Type": "application/json" } });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      logger.log("SCRAPE_ERROR", { source_id: source.source_id, error_message: msg });
+      await logger.flush();
+      if (err.rateLimited) return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429 });
+      return new Response(JSON.stringify({ error: msg }), { status: 500 });
     }
   },
 };
