@@ -8,10 +8,9 @@ crons = ["*/5 * * * *"]
 
 [vars]
 PIPELINE_ENABLED = "true"
-WORKER_ID = "dispatcher-01"
+WORKER_ID = "dispatcher-v3"
 
-# Service bindings — correct CF Worker-to-Worker communication
-# (HTTP fetch to workers.dev URLs does NOT work per CF docs)
+# Service bindings — Worker-to-Worker (CF required method)
 [[services]]
 binding = "SCRAPER_TEXT"
 service = "detect-ai-scraper-text"
@@ -31,3 +30,8 @@ service = "detect-ai-text-news"
 [[services]]
 binding = "SCRAPER_IMAGE_OPEN"
 service = "detect-ai-image-open"
+
+# Secrets injected via GitHub Actions:
+# SUPABASE_URL, SUPABASE_SERVICE_KEY, HF_TOKEN, YOUTUBE_API_KEY,
+# UNSPLASH_ACCESS_KEY, PEXELS_API_KEY, PIXABAY_API_KEY,
+# UPSTASH_REDIS_URL, UPSTASH_REDIS_TOKEN

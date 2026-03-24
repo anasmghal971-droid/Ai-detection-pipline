@@ -1,8 +1,8 @@
-name: Supabase Buffer Cleanup
+name: Supabase Cleanup
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours
+    - cron: "0 */2 * * *"   # every 2 hours
   workflow_dispatch:
 
 env:
@@ -10,12 +10,13 @@ env:
 
 jobs:
   cleanup:
-    name: "🧹 Clean Supabase Buffer"
+    name: "🧹 Clean Buffer + Vacuum"
     runs-on: ubuntu-latest
     steps:
-      - name: Run cleanup via Supabase RPC
+      - name: Run cleanup + check storage
         run: |
-          RESULT=$(curl -s -X POST \
+          echo "Running cleanup..."
+          RESULT=$(curl -sf -X POST \
             "${{ secrets.SUPABASE_URL }}/rest/v1/rpc/run_full_cleanup" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" \
@@ -23,16 +24,20 @@ jobs:
             -d '{}')
           echo "Cleanup result: $RESULT"
 
-      - name: Check storage usage
-        run: |
-          curl -s \
+          echo "Storage usage:"
+          curl -sf \
             "${{ secrets.SUPABASE_URL }}/rest/v1/storage_usage?select=table_name,total_size,live_rows" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" | \
             python3 -c "
 import sys, json
-rows = json.load(sys.stdin)
-print('Storage usage:')
-for r in rows:
-    print(f'  {r[\"table_name\"]:25s} {r[\"total_size\"]:>10s}  ({r[\"live_rows\"]:,} rows)')
+try:
+    rows = json.load(sys.stdin)
+    total_mb = 0
+    for r in rows:
+        mb = r.get('total_size','0')
+        print(f'  {r[\"table_name\"]:28s} {mb:>10s}  ({r[\"live_rows\"]:>8,} rows)')
+except Exception as e:
+    print(f'Error: {e}')
+    print(sys.stdin.read()[:500])
 "

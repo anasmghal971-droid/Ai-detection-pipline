@@ -1,368 +1,287 @@
 // ============================================================
-// DETECT-AI: Worker Dispatcher (Stage 1)
-// Cloudflare Worker — Source Queue Orchestration
-//
-// Responsibilities:
-//   - Pull highest-priority pending source from Supabase queue
-//   - Assign to calling worker instance
-//   - Heartbeat tracking (30s timeout)
-//   - Auto-requeue timed-out jobs
-//   - Global kill switch enforcement
-//   - Dynamic reallocation for slow/blocked sources
+// DETECT-AI: Dispatcher v3 — 20 Concurrent Workers
+// 
+// Architecture:
+//   - 20 parallel slots per cron tick (was 3)
+//   - Smart rotation: after each scrape, source drops to BOTTOM
+//     of priority so all 27 sources get equal turns
+//   - Hard 25s timeout per scraper call (CF worker limit = 30s)
+//   - Full error isolation — one failed source never blocks others
+//   - Auto-cleanup trigger after every cron cycle
 // ============================================================
 
-import type { Env, SourceQueueItem } from "../../shared/types/index";
+import type { SourceQueueItem } from "../../shared/types/index";
 import { createSupabaseClient } from "./supabase";
 import { PipelineLogger } from "./logger";
 
-// ── Constants ─────────────────────────────────────────────────
-const WORKER_TIMEOUT_MS     = 30_000;   // 30 seconds
-const MAX_RETRIES            = 3;
-const HEARTBEAT_INTERVAL_MS  = 10_000;  // Worker updates heartbeat every 10s
-const RATE_LIMIT_BACKOFF_MS  = 60_000;  // 60s before retrying rate-limited source
+const WORKER_TIMEOUT_MS    = 25_000;  // 25s — under CF 30s limit
+const HEARTBEAT_MS         = 8_000;
+const RATE_LIMIT_BACKOFF   = 300_000; // 5 min cooldown on rate limit
+const CONCURRENT_SLOTS     = 20;      // 20 workers in parallel per cron tick
+const MAX_RETRY_COUNT      = 2;       // fail fast — don't waste slots on broken sources
 
-// ── Retry helper with exponential backoff ─────────────────────
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  maxAttempts = MAX_RETRIES,
-  baseDelayMs = 1_000
-): Promise<T> {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (attempt === maxAttempts) throw err;
-      const delay = baseDelayMs * Math.pow(2, attempt - 1);
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-  throw new Error("Max retries exceeded");
+// ── Env type ─────────────────────────────────────────────────
+interface Fetcher { fetch(url: string, init?: RequestInit): Promise<Response> }
+interface Env {
+  SUPABASE_URL:         string;
+  SUPABASE_SERVICE_KEY: string;
+  HF_TOKEN?:            string;
+  WORKER_ID?:           string;
+  PIPELINE_ENABLED?:    string;
+  // Service bindings
+  SCRAPER_TEXT:         Fetcher;
+  SCRAPER_IMAGE:        Fetcher;
+  SCRAPER_VIDEO:        Fetcher;
+  SCRAPER_TEXT_NEWS:    Fetcher;
+  SCRAPER_IMAGE_OPEN:   Fetcher;
 }
 
-// ── Dispatcher: claim next available source ───────────────────
-async function claimNextSource(
-  env: Env,
-  logger: PipelineLogger
-): Promise<SourceQueueItem | null> {
-  const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
+// ── Source → scraper binding map ─────────────────────────────
+function getScraperBinding(sourceId: string, env: Env): Fetcher | null {
+  const map: Record<string, Fetcher> = {
+    // Text sources
+    "bbc-news":       env.SCRAPER_TEXT,
+    "reuters":        env.SCRAPER_TEXT,
+    "guardian":       env.SCRAPER_TEXT,
+    "nytimes":        env.SCRAPER_TEXT,
+    "aljazeera":      env.SCRAPER_TEXT,
+    "wikipedia":      env.SCRAPER_TEXT,
+    "arxiv":          env.SCRAPER_TEXT,
+    "npr":            env.SCRAPER_TEXT,
+    "paperswithcode": env.SCRAPER_TEXT,
+    "stackexchange":  env.SCRAPER_TEXT,
+    "reddit":         env.SCRAPER_TEXT,
+    "worldbank":      env.SCRAPER_TEXT,
+    // Real image sources
+    "unsplash":       env.SCRAPER_IMAGE,
+    "pexels":         env.SCRAPER_IMAGE,
+    "pixabay":        env.SCRAPER_IMAGE,
+    "openverse":      env.SCRAPER_IMAGE,
+    "wikimedia":      env.SCRAPER_IMAGE,
+    "nasa":           env.SCRAPER_IMAGE,
+    "met-museum":     env.SCRAPER_IMAGE,
+    // AI-generated image sources
+    "civitai":        env.SCRAPER_IMAGE,
+    "pollinations":   env.SCRAPER_IMAGE,
+    "diffusiondb":    env.SCRAPER_IMAGE,
+    "lexica":         env.SCRAPER_IMAGE,
+    // Video sources
+    "youtube":        env.SCRAPER_VIDEO,
+    "pexels-video":   env.SCRAPER_VIDEO,
+    "ted-talks":      env.SCRAPER_VIDEO,
+    "voxceleb":       env.SCRAPER_VIDEO,
+  };
+  return map[sourceId] ?? null;
+}
 
-  // Step 1: Release timed-out sources back to 'pending'
-  const timeoutThreshold = new Date(Date.now() - WORKER_TIMEOUT_MS).toISOString();
-  await db
-    .from("sources_queue")
-    .update({
-      status: "pending",
-      worker_id: null,
-      heartbeat_at: null,
-      error_message: "Worker timeout — auto-requeued",
-    })
-    .eq("status", "active")
-    .lt("heartbeat_at", timeoutThreshold);
+// ── DB helpers ────────────────────────────────────────────────
+function db(env: Env) {
+  return createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
+}
 
-  // Step 2: Release rate-limited sources that have cooled down
-  const rateLimitThreshold = new Date(Date.now() - RATE_LIMIT_BACKOFF_MS).toISOString();
-  await db
-    .from("sources_queue")
-    .update({ status: "pending" })
+async function claimSource(env: Env, workerId: string): Promise<SourceQueueItem | null> {
+  const d = db(env);
+  const now = new Date().toISOString();
+
+  // Release timed-out active sources
+  await d.from("sources_queue").update({
+    status: "pending", worker_id: null, heartbeat_at: null,
+    error_message: "Timed out — auto-requeued"
+  }).eq("status", "active").lt("heartbeat_at", new Date(Date.now() - WORKER_TIMEOUT_MS).toISOString());
+
+  // Release rate-limited sources that have cooled down
+  await d.from("sources_queue").update({ status: "pending", worker_id: null })
     .eq("status", "rate_limited")
-    .lt("updated_at", rateLimitThreshold);
+    .lt("updated_at", new Date(Date.now() - RATE_LIMIT_BACKOFF).toISOString());
 
-  // Step 3: Claim the highest-priority pending source
-  // Uses select + update pattern for atomic-ish claim
-  const { data: sources, error } = await db
-    .from("sources_queue")
-    .select("*")
+  // Claim highest-priority pending source
+  const { data } = await d.from("sources_queue").select("*")
     .eq("status", "pending")
-    .lt("retry_count", MAX_RETRIES)
+    .lt("retry_count", MAX_RETRY_COUNT)
     .order("priority_score", { ascending: false })
     .limit(1);
 
-  if (error || !sources || (sources as SourceQueueItem[]).length === 0) {
-    return null;
-  }
+  if (!data || data.length === 0) return null;
+  const source = data[0] as SourceQueueItem;
 
-  const source = (sources as SourceQueueItem[])[0];
+  // Optimistic lock
+  const { error } = await d.from("sources_queue").update({
+    status: "active", worker_id: workerId, heartbeat_at: now
+  }).eq("source_id", source.source_id).eq("status", "pending");
 
-  // Mark as active + assign worker
-  const { error: updateError } = await db
-    .from("sources_queue")
-    .update({
-      status: "active",
-      worker_id: env.WORKER_ID,
-      heartbeat_at: new Date().toISOString(),
-      error_message: null,
-    })
-    .eq("source_id", source.source_id)
-    .eq("status", "pending"); // Optimistic lock — prevent race condition
-
-  if (updateError) return null; // Another worker claimed it first
-
-  logger.log("SCRAPE_START", { source_id: source.source_id });
-  return source;
+  return error ? null : source;
 }
 
-// ── Mark source complete / failed ────────────────────────────
-async function completeSource(
-  env: Env,
-  sourceId: string,
-  success: boolean,
-  errorMsg?: string
+async function releaseSource(
+  env: Env, sourceId: string, 
+  success: boolean, samplesCount: number, errorMsg?: string
 ): Promise<void> {
-  const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
+  const d = db(env);
+  // After success: drop priority by 10 so other sources get turns
+  // After failure: increment retry_count, keep low priority
+  if (success) {
+    await d.from("sources_queue").update({
+      status: "pending",
+      worker_id: null, heartbeat_at: null,
+      last_crawled_at: new Date().toISOString(),
+      retry_count: 0, error_message: null,
+      priority_score: undefined, // will use SQL to decrement
+    }).eq("source_id", sourceId);
+    // Lower priority after successful scrape (fair rotation)
+    await db(env).from("sources_queue").update({
+      priority_score: undefined,
+    }).eq("source_id", sourceId);
+    // Use RPC to decrement
+    const { data: row } = await d.from("sources_queue").select("priority_score").eq("source_id", sourceId);
+    if (row && row[0]) {
+      const newScore = Math.max(1, ((row[0] as any).priority_score ?? 50) - 10);
+      await d.from("sources_queue").update({ priority_score: newScore }).eq("source_id", sourceId);
+    }
+  } else {
+    await d.from("sources_queue").update({
+      status: "pending",
+      worker_id: null, heartbeat_at: null,
+      error_message: errorMsg ?? "Unknown error",
+    }).eq("source_id", sourceId);
+    // Raw increment retry_count via select then update
+    const { data: row } = await d.from("sources_queue").select("retry_count").eq("source_id", sourceId);
+    const rc = row && row[0] ? ((row[0] as any).retry_count ?? 0) + 1 : 1;
+    await d.from("sources_queue").update({ retry_count: rc }).eq("source_id", sourceId);
+  }
+}
 
-  await db.from("sources_queue").update({
-    status: success ? "pending" : "failed",  // 'pending' so sources rotate every cycle
-    last_crawled_at: new Date().toISOString(),
-    worker_id: null,
-    heartbeat_at: null,
-    retry_count: success ? 0 : undefined,
-    error_message: errorMsg ?? null,
+async function markRateLimited(env: Env, sourceId: string): Promise<void> {
+  await db(env).from("sources_queue").update({
+    status: "rate_limited", worker_id: null, error_message: "Rate limited — cooling 5min"
   }).eq("source_id", sourceId);
 }
 
-// ── Mark source rate-limited ──────────────────────────────────
-async function rateLimitSource(env: Env, sourceId: string): Promise<void> {
-  const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
-  await db.from("sources_queue").update({
-    status: "rate_limited",
-    worker_id: null,
-    error_message: "Rate limit hit — cooling down",
-  }).eq("source_id", sourceId);
+async function heartbeat(env: Env, sourceId: string, workerId: string): Promise<void> {
+  await db(env).from("sources_queue").update({
+    heartbeat_at: new Date().toISOString()
+  }).eq("source_id", sourceId).eq("worker_id", workerId);
 }
 
-// ── Update heartbeat ──────────────────────────────────────────
-async function updateHeartbeat(env: Env, sourceId: string): Promise<void> {
-  const db = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
-  await db.from("sources_queue").update({
-    heartbeat_at: new Date().toISOString(),
-  }).eq("source_id", sourceId).eq("worker_id", env.WORKER_ID);
+// ── Call scraper via service binding ─────────────────────────
+async function callScraper(
+  scraper: Fetcher, source: SourceQueueItem, env: Env, workerId: string
+): Promise<{ samplesScraped: number; rateLimited: boolean }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), WORKER_TIMEOUT_MS);
+
+  try {
+    const res = await scraper.fetch("https://internal/scrape", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source,
+        worker_id: workerId,
+        supabase_url: env.SUPABASE_URL,
+        supabase_key: env.SUPABASE_SERVICE_KEY,
+      }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+
+    if (res.status === 429) return { samplesScraped: 0, rateLimited: true };
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+
+    const json = await res.json() as { samples_scraped?: number };
+    return { samplesScraped: json.samples_scraped ?? 0, rateLimited: false };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-// ── Dispatch job to appropriate scraper ──────────────────────
-async function dispatchToScraper(
-  source: SourceQueueItem,
-  env: Env,
-  logger: PipelineLogger
-): Promise<{ success: boolean; samplesScraped: number; rateLimited?: boolean }> {
-  // CF docs: Worker-to-Worker communication MUST use service bindings
-  // fetch() to workers.dev URLs does NOT work between workers
-  // Service bindings are declared in wrangler.toml [[services]] blocks
+// ── Process one source slot ───────────────────────────────────
+async function processOneSlot(env: Env, workerId: string, logger: PipelineLogger): Promise<void> {
+  const source = await claimSource(env, workerId).catch(() => null);
+  if (!source) return; // No more pending sources
 
-  // Map source_id to the correct service binding on env
-  type Fetcher = { fetch: (url: string, init?: RequestInit) => Promise<Response> };
-  const scraperMap: Record<string, Fetcher | undefined> = {
-    // Text sources — ALL mapped, NO gaps
-    "bbc-news":        env.SCRAPER_TEXT,
-    "reuters":         env.SCRAPER_TEXT,
-    "guardian":        env.SCRAPER_TEXT,
-    "nytimes":         env.SCRAPER_TEXT,
-    "aljazeera":       env.SCRAPER_TEXT,
-    "wikipedia":       env.SCRAPER_TEXT,
-    "arxiv":           env.SCRAPER_TEXT,
-    "npr":             env.SCRAPER_TEXT,
-    "paperswithcode":  env.SCRAPER_TEXT,
-    "stackexchange":   env.SCRAPER_TEXT,
-    "reddit":          env.SCRAPER_TEXT,
-    "worldbank":       env.SCRAPER_TEXT,
-    // REAL image sources
-    "unsplash":        env.SCRAPER_IMAGE,
-    "pexels":          env.SCRAPER_IMAGE,
-    "pixabay":         env.SCRAPER_IMAGE,
-    "openverse":       env.SCRAPER_IMAGE,
-    "wikimedia":       env.SCRAPER_IMAGE,
-    "nasa":            env.SCRAPER_IMAGE,
-    "met-museum":      env.SCRAPER_IMAGE,
-    // AI-GENERATED image sources — THE KEY ONES FOR DETECTION TRAINING
-    "lexica":          env.SCRAPER_IMAGE,
-    "civitai":         env.SCRAPER_IMAGE,
-    "pollinations":    env.SCRAPER_IMAGE,
-    "diffusiondb":     env.SCRAPER_IMAGE,
-    // Video sources
-    "pexels-video":    env.SCRAPER_VIDEO,
-    "youtube":         env.SCRAPER_VIDEO,
-    "ted-talks":       env.SCRAPER_VIDEO,
-    "voxceleb":        env.SCRAPER_VIDEO,
-  };
-
-  const scraper = scraperMap[source.source_id];
+  const scraper = getScraperBinding(source.source_id, env);
   if (!scraper) {
     logger.log("SCRAPE_ERROR", {
       source_id: source.source_id,
-      error_message: `No service binding for source: ${source.source_id}`,
+      error_message: `No binding for source: ${source.source_id} — check dispatcher scraperMap`,
     });
-    return { success: false, samplesScraped: 0 };
+    await releaseSource(env, source.source_id, false, 0, "No scraper binding");
+    return;
   }
 
-  // Call via service binding — same Cloudflare network, zero latency
-  const payload = JSON.stringify({
-    source,
-    worker_id:    env.WORKER_ID,
-    supabase_url: env.SUPABASE_URL,
-    supabase_key: env.SUPABASE_SERVICE_KEY,
-  });
+  // Heartbeat while scraping
+  const hb = setInterval(() => heartbeat(env, source.source_id, workerId), HEARTBEAT_MS);
 
-  const response = await withRetry(() =>
-    scraper.fetch("https://internal/scrape", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: payload,
-    })
-  );
+  try {
+    const result = await callScraper(scraper, source, env, workerId);
+    clearInterval(hb);
 
-  if (response.status === 429) {
-    return { success: false, samplesScraped: 0, rateLimited: true };
+    if (result.rateLimited) {
+      await markRateLimited(env, source.source_id);
+      logger.log("RATE_LIMIT_HIT", { source_id: source.source_id });
+    } else {
+      await releaseSource(env, source.source_id, true, result.samplesScraped);
+      logger.log("SCRAPE_COMPLETE", {
+        source_id:    source.source_id,
+        sample_count: result.samplesScraped,
+      });
+    }
+  } catch (err: unknown) {
+    clearInterval(hb);
+    const msg = err instanceof Error ? err.message : String(err);
+    await releaseSource(env, source.source_id, false, 0, msg);
+    logger.log("SCRAPE_ERROR", { source_id: source.source_id, error_message: msg });
   }
-  if (!response.ok) {
-    throw new Error(`Scraper ${source.source_id} returned ${response.status}: ${await response.text()}`);
-  }
-
-  const result = await response.json() as { samples_scraped: number };
-  return { success: true, samplesScraped: result.samples_scraped };
 }
 
-// ── Main Worker Handler ───────────────────────────────────────
+// ── Cleanup trigger ───────────────────────────────────────────
+async function triggerCleanup(env: Env): Promise<void> {
+  try {
+    const d = db(env);
+    // Delete old staging rows (>24hrs)
+    await d.from("samples_staging").delete()
+      .lt("scraped_at", new Date(Date.now() - 86_400_000).toISOString())
+      .eq("status", "staged");
+    // Delete old processed rows (>72hrs)
+    await d.from("samples_processed").delete()
+      .lt("labeled_at", new Date(Date.now() - 259_200_000).toISOString());
+  } catch { /* non-critical */ }
+}
+
+// ── Main export ───────────────────────────────────────────────
 export default {
+  // HTTP handler for manual triggers
   async fetch(request: Request, env: Env): Promise<Response> {
-    // ── Kill Switch ──────────────────────────────────────────
-    if (env.PIPELINE_ENABLED !== "true") {
-      console.log(JSON.stringify({
-        event: "KILL_SWITCH_ACTIVE",
-        worker_id: env.WORKER_ID,
-        timestamp: new Date().toISOString(),
-      }));
-      return new Response(JSON.stringify({ status: "pipeline_disabled" }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+    if (env.PIPELINE_ENABLED === "false") {
+      return new Response(JSON.stringify({ status: "disabled" }), { status: 200 });
     }
-
     const logger = new PipelineLogger(env);
-    logger.log("WORKER_START");
-
-    const startTime = Date.now();
-    let source: SourceQueueItem | null = null;
-
-    try {
-      // ── Claim a source ──────────────────────────────────────
-      source = await claimNextSource(env, logger);
-
-      if (!source) {
-        return new Response(
-          JSON.stringify({ status: "no_sources_available" }),
-          { status: 200, headers: { "Content-Type": "application/json" } }
-        );
-      }
-
-      // ── Heartbeat: update every 10s during processing ──────
-      // (In real CF Workers, use Durable Objects for long-running)
-      const heartbeatInterval = setInterval(
-        () => updateHeartbeat(env, source!.source_id),
-        HEARTBEAT_INTERVAL_MS
-      );
-
-      try {
-        const result = await dispatchToScraper(source, env, logger);
-
-        clearInterval(heartbeatInterval);
-
-        if (result.rateLimited) {
-          await rateLimitSource(env, source.source_id);
-          logger.log("RATE_LIMIT_HIT", { source_id: source.source_id });
-          return new Response(
-            JSON.stringify({ status: "rate_limited", source: source.source_id }),
-            { status: 200, headers: { "Content-Type": "application/json" } }
-          );
-        }
-
-        await completeSource(env, source.source_id, result.success);
-
-        const durationMs = Date.now() - startTime;
-        logger.log("SCRAPE_COMPLETE", {
-          source_id: source.source_id,
-          sample_count: result.samplesScraped,
-          duration_ms: durationMs,
-        });
-
-        await logger.flush();
-
-        return new Response(
-          JSON.stringify({
-            status: "success",
-            source: source.source_id,
-            samples_scraped: result.samplesScraped,
-            duration_ms: durationMs,
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } }
-        );
-
-      } catch (innerErr) {
-        clearInterval(heartbeatInterval);
-        throw innerErr;
-      }
-
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      const durationMs = Date.now() - startTime;
-
-      logger.log("SCRAPE_ERROR", {
-        source_id: source?.source_id,
-        error_message: errorMsg,
-        duration_ms: durationMs,
-      });
-
-      if (source) {
-        await completeSource(env, source.source_id, false, errorMsg);
-      }
-
-      await logger.flush();
-
-      return new Response(
-        JSON.stringify({ status: "error", error: errorMsg }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
-      );
-    }
+    const workerId = `manual-${Date.now()}`;
+    await processOneSlot(env, workerId, logger);
+    await logger.flush();
+    return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
   },
 
-  // ── Cron Trigger: runs every 5 minutes ───────────────────────
+  // Cron: fires every 5 minutes — runs 20 slots in parallel
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(
-      (async () => {
-        if (env.PIPELINE_ENABLED !== "true") return;
+    if (env.PIPELINE_ENABLED === "false") return;
 
-        const logger = new PipelineLogger(env);
-        logger.log("CRON_TICK", { timestamp: new Date().toISOString() });
+    ctx.waitUntil((async () => {
+      const logger = new PipelineLogger(env);
+      logger.log("CRON_TICK", { slots: CONCURRENT_SLOTS, ts: new Date().toISOString() });
 
-        // Process up to 10 sources per cron cycle concurrently
-        // Each claimNextSource() picks the highest-priority pending source
-        // 3 concurrent cycles — prevents any single API from being rate-limited
-        const cycles = Array.from({ length: 3 }, async (_, i) => {
-          const source = await claimNextSource(env, logger).catch(() => null);
-          if (!source) return;
+      // 20 parallel slots — each independently claims + processes a source
+      const slots = Array.from({ length: CONCURRENT_SLOTS }, (_, i) =>
+        processOneSlot(env, `cron-slot-${i + 1}`, logger).catch(e =>
+          logger.log("SLOT_ERROR", { slot: i + 1, error: String(e) })
+        )
+      );
 
-          const hb = setInterval(() => updateHeartbeat(env, source.source_id), HEARTBEAT_INTERVAL_MS);
-          try {
-            const result = await dispatchToScraper(source, env, logger);
-            clearInterval(hb);
-            if (result.rateLimited) {
-              await rateLimitSource(env, source.source_id);
-            } else {
-              await completeSource(env, source.source_id, result.success);
-              logger.log("SCRAPE_COMPLETE", {
-                source_id: source.source_id,
-                sample_count: result.samplesScraped,
-              });
-            }
-          } catch (e) {
-            clearInterval(hb);
-            const msg = e instanceof Error ? e.message : String(e);
-            await completeSource(env, source.source_id, false, msg);
-            logger.log("SCRAPE_ERROR", { source_id: source.source_id, error_message: msg });
-          }
-        });
+      await Promise.allSettled(slots);
 
-        await Promise.allSettled(cycles);
-        await logger.flush();
-      })()
-    );
+      // Cleanup old data after every cron cycle
+      await triggerCleanup(env);
+
+      await logger.flush();
+    })());
   },
 };
