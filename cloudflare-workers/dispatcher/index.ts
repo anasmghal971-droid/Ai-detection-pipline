@@ -1,5 +1,5 @@
 // ============================================================
-// DETECT-AI: Dispatcher v3.1 — Fixed
+// DETECT-AI: Dispatcher v3.3 — Atomic RPC claiming (SELECT FOR UPDATE SKIP LOCKED)
 //
 // Changes from v3:
 //   FIX 1: releaseSource() — removed `priority_score: undefined`
@@ -17,7 +17,7 @@ import { PipelineLogger } from "./logger";
 const WORKER_TIMEOUT_MS    = 25_000;
 const HEARTBEAT_MS         = 8_000;
 const RATE_LIMIT_BACKOFF   = 300_000;
-const CONCURRENT_SLOTS     = 50;      // increased from 20 for 10M target
+const CONCURRENT_SLOTS     = 15;      // 15 = safe for Supabase free tier (was 50, caused connection pool exhaustion)
 const MAX_RETRY_COUNT      = 2;
 
 interface ScheduledEvent { cron: string; scheduledTime: number; }
@@ -95,34 +95,25 @@ async function checkSupabaseConnectivity(env: Env): Promise<boolean> {
   }
 }
 
+// ── Atomic source claiming via Supabase RPC ──────────────────────────────
+// Uses SELECT FOR UPDATE SKIP LOCKED — each concurrent caller gets a
+// DIFFERENT source, eliminating race conditions and cutting 4 HTTP calls
+// down to 1 per slot.
 async function claimSource(env: Env, workerId: string): Promise<SourceQueueItem | null> {
-  const d = db(env);
-  const now = new Date().toISOString();
-
-  await d.from("sources_queue").update({
-    status: "pending", worker_id: null, heartbeat_at: null,
-    error_message: "Timed out — auto-requeued"
-  }).eq("status", "active").lt("heartbeat_at", new Date(Date.now() - WORKER_TIMEOUT_MS).toISOString());
-
-  await d.from("sources_queue").update({ status: "pending", worker_id: null })
-    .eq("status", "rate_limited")
-    .lt("updated_at", new Date(Date.now() - RATE_LIMIT_BACKOFF).toISOString());
-
-  const { data } = await d.from("sources_queue").select("*")
-    .eq("status", "pending")
-    .lt("retry_count", MAX_RETRY_COUNT)
-    .order("priority_score", { ascending: false })
-    .limit(1);
-
-  const rows = data as any[];
-  if (!rows || rows.length === 0) return null;
-  const source = rows[0] as SourceQueueItem;
-
-  const { error } = await d.from("sources_queue").update({
-    status: "active", worker_id: workerId, heartbeat_at: now
-  }).eq("source_id", source.source_id).eq("status", "pending");
-
-  return error ? null : source;
+  try {
+    const d = db(env);
+    const { data, error } = await d.rpc("claim_next_source", {
+      p_worker_id:  workerId,
+      p_timeout_ms: WORKER_TIMEOUT_MS,
+      p_backoff_ms: RATE_LIMIT_BACKOFF,
+    });
+    if (error || !data) return null;
+    const rows = data as any[];
+    return rows.length > 0 ? (rows[0] as SourceQueueItem) : null;
+  } catch (e) {
+    console.error(JSON.stringify({ event: "CLAIM_ERROR", error: String(e) }));
+    return null;
+  }
 }
 
 // ── FIX 1: releaseSource — no more `priority_score: undefined` ────
