@@ -165,8 +165,7 @@ class HFPushManager:
             params={
                 "select": "language",
                 "content_type": f"eq.{content_type}",
-                "status": "eq.labeled",
-                "group": "language",
+                "hf_pushed": "eq.false",
             },
             timeout=15
         )
@@ -181,7 +180,6 @@ class HFPushManager:
             params={
                 "content_type": f"eq.{content_type}",
                 "language":     f"eq.{language}",
-                "status":       "eq.labeled",
                 "hf_pushed":    "eq.false",
             },
             timeout=15
@@ -198,7 +196,6 @@ class HFPushManager:
                 "select": "*",
                 "content_type": f"eq.{content_type}",
                 "language":     f"eq.{language}",
-                "status":       "eq.labeled",
                 "hf_pushed":    "eq.false",
                 "order":        "labeled_at.asc",
                 "limit":        limit,
@@ -270,7 +267,7 @@ class HFPushManager:
                 f"{SUPABASE_URL}/rest/v1/samples_processed",
                 headers=SB_HEADERS,
                 params={"sample_id": f"in.({','.join(batch)})"},
-                json={"hf_pushed": True, "hf_shard": shard_num, "status": "pushed"},
+                json={"hf_pushed": True, "hf_shard": shard_num},
                 timeout=20
             )
 

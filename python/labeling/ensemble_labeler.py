@@ -395,3 +395,11 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# ── Compatibility shims for ensemble_labeler_once.py ──────────────────────────
+# once.py imports check_shard_trigger and record_metrics by name
+check_shard_trigger = check_and_push_shard   # alias
+
+async def record_metrics(db: SupabaseClient):
+    """Log basic pipeline metrics (no-op — metrics visible via Supabase queries)."""
+    pass
