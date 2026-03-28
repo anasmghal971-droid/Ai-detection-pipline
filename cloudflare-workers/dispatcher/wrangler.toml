@@ -8,7 +8,7 @@ crons = ["*/5 * * * *"]
 
 [vars]
 PIPELINE_ENABLED = "true"
-WORKER_ID = "dispatcher-v3"
+WORKER_ID = "dispatcher-v3.2"
 
 # Service bindings — Worker-to-Worker (CF required method)
 [[services]]

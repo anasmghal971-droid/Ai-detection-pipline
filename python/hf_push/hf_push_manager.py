@@ -40,7 +40,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 # ── Rate limit config (safe for 2M/day) ─────────────────────────
-SHARD_SIZE          = 200_000   # rows per Parquet shard
+SHARD_SIZE          = 10_000    # rows per Parquet shard (was 200k — lowered to push early and often)
 MAX_COMMITS_PER_HR  = 40        # Well under 50/hr limit (20% safety margin)
 MIN_SECONDS_BETWEEN = 5         # Min gap between commits
 MAX_FILES_PER_COMMIT= 50        # Well under HF's ~100 file recommendation

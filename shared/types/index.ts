@@ -87,7 +87,8 @@ export type WorkerEvent =
   | "LABEL_START"  | "LABEL_COMPLETE"  | "LABEL_ERROR"
   | "SHARD_PUSH"   | "SHARD_ERROR"
   | "RATE_LIMIT_HIT" | "WORKER_TIMEOUT" | "WORKER_START"
-  | "KILL_SWITCH_ACTIVE";
+  | "KILL_SWITCH_ACTIVE"
+  | "CRON_TICK" | "SLOT_ERROR" | "RATE_LIMIT_HIT" | "INSERT_ERROR";
 
 export interface WorkerLog {
   event: WorkerEvent;

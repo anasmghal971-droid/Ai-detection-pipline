@@ -91,7 +91,7 @@ async function scrapeWikipedia(): Promise<any[]> {
   const langs = ["en","ar","fr","de","es","zh","ja","ko","pt","hi"];
   const out: any[] = [];
   await Promise.allSettled(langs.map(async lang => {
-    const d = await safeJSON(`https://${lang}.wikipedia.org/w/api.php?action=query&list=random&rnlimit=15&rnnamespace=0&format=json&origin=*`);
+    const d = await safeJSON(`https://${lang}.wikipedia.org/w/api.php?action=query&list=random&rnlimit=50&rnnamespace=0&format=json&origin=*`);
     if (!d?.query?.random) return;
     await Promise.allSettled(d.query.random.map(async (p: any) => {
       const e = await safeJSON(`https://${lang}.wikipedia.org/w/api.php?action=query&pageids=${p.id}&prop=extracts&exintro=true&format=json&origin=*`);
@@ -112,7 +112,7 @@ async function scrapeArxiv(): Promise<any[]> {
   const cat  = cats[Math.floor(Math.random() * cats.length)];
   const xml  = await safeFetch(`https://export.arxiv.org/rss/${cat}`);
   if (!xml) return [];
-  return parseRSS(xml, "en", "arxiv").slice(0, 40).map(a => ({
+  return parseRSS(xml, "en", "arxiv").slice(0, 100).map(a => ({
     ...a, metadata: { ...a.metadata, category: cat, tags: ["arxiv","academic","research","human-content"] }
   }));
 }
@@ -120,7 +120,7 @@ async function scrapeArxiv(): Promise<any[]> {
 async function scrapeStackExchange(): Promise<any[]> {
   const sites = ["stackoverflow","superuser","datascience","ai","stats"];
   const site  = sites[Math.floor(Math.random() * sites.length)];
-  const d     = await safeJSON(`https://api.stackexchange.com/2.3/questions?order=desc&sort=votes&site=${site}&filter=withbody&pagesize=30`);
+  const d     = await safeJSON(`https://api.stackexchange.com/2.3/questions?order=desc&sort=votes&site=${site}&filter=withbody&pagesize=50`);
   if (!d?.items) return [];
   return d.items.map((q: any) => ({
     source_url:  q.link,
@@ -130,7 +130,7 @@ async function scrapeStackExchange(): Promise<any[]> {
 }
 
 async function scrapePapersWithCode(): Promise<any[]> {
-  const d = await safeJSON("https://paperswithcode.com/api/v1/papers/?format=json&items_per_page=30&ordering=-arxiv_id");
+  const d = await safeJSON("https://paperswithcode.com/api/v1/papers/?format=json&items_per_page=50&ordering=-arxiv_id");
   if (!d?.results) return [];
   return d.results.filter((p: any) => p.abstract?.length > 50).map((p: any) => ({
     source_url:  p.url_abs ?? `https://paperswithcode.com/paper/${p.id}`,
@@ -140,9 +140,9 @@ async function scrapePapersWithCode(): Promise<any[]> {
 }
 
 async function scrapeReddit(env: Env): Promise<any[]> {
-  const subs = ["worldnews","science","technology","MachineLearning","datascience"];
+  const subs = ["worldnews","science","technology","MachineLearning","datascience","programming","philosophy","history","economics","geopolitics","climate","space","medicine","law","education"];
   const sub  = subs[Math.floor(Math.random() * subs.length)];
-  const d    = await safeJSON(`https://www.reddit.com/r/${sub}/hot.json?limit=25`, { headers: { "User-Agent": "DETECT-AI/1.0" } });
+  const d    = await safeJSON(`https://www.reddit.com/r/${sub}/hot.json?limit=50`, { headers: { "User-Agent": "DETECT-AI/1.0" } });
   if (!d?.data?.children) return [];
   return d.data.children
     .filter((p: any) => p.data?.selftext?.length > 50)
@@ -154,7 +154,7 @@ async function scrapeReddit(env: Env): Promise<any[]> {
 }
 
 async function scrapeWorldBank(): Promise<any[]> {
-  const d = await safeJSON("https://search.worldbank.org/api/v3/wds?format=json&rows=30&os=0&fl=id,title,docdt,abstract&srt=docdt&order=desc");
+  const d = await safeJSON("https://search.worldbank.org/api/v3/wds?format=json&rows=50&os=0&fl=id,title,docdt,abstract&srt=docdt&order=desc");
   if (!d?.documents) return [];
   return Object.values(d.documents as Record<string,any>)
     .filter((doc: any) => doc.abstract?.length > 50)
@@ -201,7 +201,7 @@ export default {
       const d = createSupabaseClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
       const enriched: DetectAISample[] = raw
         .filter((s: any) => (s.raw_content ?? "").length > 80)
-        .slice(0, 500)
+        .slice(0, 1000)
         .map((s: any) => ({
           sample_id:        uuidv4(),
           source_id:        source.source_id,

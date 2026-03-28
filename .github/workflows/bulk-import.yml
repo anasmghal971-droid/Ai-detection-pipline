@@ -1,0 +1,164 @@
+name: "🚀 Bulk Import — 10M Samples"
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit_per_job:
+        description: "Samples per job (default 1000000)"
+        required: false
+        default: "1000000"
+  schedule:
+    # Run daily at 00:00 UTC to keep topping up
+    - cron: "0 0 * * *"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  HF_DATASET_REPO: "anas775/DETECT-AI-Dataset"
+
+jobs:
+
+  # ── 8 parallel bulk import jobs ──────────────────────────────────────────
+  bulk-import:
+    name: "📦 ${{ matrix.source }} (shard ${{ matrix.shard_start }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # 5h 40min — under GH 6h limit
+    strategy:
+      fail-fast: false      # one failure doesn't kill the others
+      max-parallel: 8
+      matrix:
+        include:
+          # DiffusionDB split 1 — 1M AI images (SD configs 0-10)
+          - source: diffusiondb
+            offset: 0
+            shard_start: 0
+            limit: 1000000
+
+          # DiffusionDB split 2 — 1M AI images (SD configs 11-20)
+          - source: diffusiondb
+            offset: 1000000
+            shard_start: 25
+            limit: 1000000
+
+          # Wikipedia multilingual text — split 1 (8 languages)
+          - source: wikipedia
+            offset: 0
+            shard_start: 50
+            limit: 1000000
+
+          # Wikipedia multilingual text — split 2 (8 more languages)
+          - source: wikipedia
+            offset: 1000000
+            shard_start: 75
+            limit: 1000000
+
+          # Pollinations AI image generation
+          - source: pollinations
+            offset: 0
+            shard_start: 100
+            limit: 1000000
+
+          # LAION filtered-WIT real images
+          - source: laion-wit
+            offset: 0
+            shard_start: 125
+            limit: 1000000
+
+          # LAION OIG instruction text
+          - source: oig
+            offset: 0
+            shard_start: 150
+            limit: 1000000
+
+          # CC-News human news text
+          - source: cc-news
+            offset: 0
+            shard_start: 175
+            limit: 1000000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            huggingface_hub \
+            pandas \
+            pyarrow \
+            requests \
+            datasets
+
+      - name: Run bulk import — ${{ matrix.source }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: "anas775/DETECT-AI-Dataset"
+        run: |
+          python python/bulk_import/bulk_hf_import.py \
+            --source "${{ matrix.source }}" \
+            --offset ${{ matrix.offset }} \
+            --limit ${{ matrix.limit || inputs.limit_per_job || 1000000 }} \
+            --shard-start ${{ matrix.shard_start }}
+
+      - name: Report
+        if: always()
+        run: |
+          echo "✅ Job ${{ matrix.source }} (offset=${{ matrix.offset }}) finished"
+
+  # ── SD Prompts bonus run (text-only AI content) ───────────────────────────
+  sd-prompts:
+    name: "📦 sd-prompts text"
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    needs: []
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install huggingface_hub pandas pyarrow requests datasets
+      - name: Run SD prompts import
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: "anas775/DETECT-AI-Dataset"
+        run: |
+          python python/bulk_import/bulk_hf_import.py \
+            --source sd-prompts \
+            --offset 0 \
+            --limit 500000 \
+            --shard-start 200
+
+  # ── Summary ───────────────────────────────────────────────────────────────
+  summary:
+    name: "📊 Push summary"
+    runs-on: ubuntu-latest
+    needs: [bulk-import, sd-prompts]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install huggingface_hub
+      - name: Count pushed shards
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - << 'EOF'
+          import os
+          from huggingface_hub import HfApi
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          files = api.list_repo_files("anas775/DETECT-AI-Dataset", repo_type="dataset")
+          parquet_files = [f for f in files if f.endswith(".parquet")]
+          print(f"Total Parquet shards in repo: {len(parquet_files)}")
+          print(f"Estimated rows: {len(parquet_files) * 50_000:,} (at 50k/shard)")
+          for f in sorted(parquet_files)[:10]:
+              print(f"  {f}")
+          if len(parquet_files) > 10:
+              print(f"  ... and {len(parquet_files) - 10} more")
+          EOF

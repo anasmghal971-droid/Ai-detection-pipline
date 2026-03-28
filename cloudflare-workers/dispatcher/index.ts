@@ -17,7 +17,7 @@ import { PipelineLogger } from "./logger";
 const WORKER_TIMEOUT_MS    = 25_000;
 const HEARTBEAT_MS         = 8_000;
 const RATE_LIMIT_BACKOFF   = 300_000;
-const CONCURRENT_SLOTS     = 20;
+const CONCURRENT_SLOTS     = 50;      // increased from 20 for 10M target
 const MAX_RETRY_COUNT      = 2;
 
 interface Fetcher { fetch(url: string, init?: RequestInit): Promise<Response> }
@@ -281,9 +281,8 @@ export default {
 
       const logger = new PipelineLogger(env);
       logger.log("CRON_TICK", {
-        slots: CONCURRENT_SLOTS,
-        ts: new Date().toISOString(),
-        db_ok: dbOk as any,
+        sample_count: CONCURRENT_SLOTS,
+        // note: only valid worker_logs columns — extra fields cause PostgREST 400
       });
 
       // FIX 2: Flush CRON_TICK immediately — guarantees it lands in DB
@@ -297,7 +296,7 @@ export default {
 
       const slots = Array.from({ length: CONCURRENT_SLOTS }, (_, i) =>
         processOneSlot(env, `cron-slot-${i + 1}`, logger).catch(e =>
-          logger.log("SLOT_ERROR", { slot: i + 1, error: String(e) } as any)
+          logger.log("SLOT_ERROR", { error_message: `slot-${i + 1}: ${String(e)}` } as any)
         )
       );
 
