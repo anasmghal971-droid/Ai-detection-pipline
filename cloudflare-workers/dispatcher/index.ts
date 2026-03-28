@@ -20,6 +20,8 @@ const RATE_LIMIT_BACKOFF   = 300_000;
 const CONCURRENT_SLOTS     = 50;      // increased from 20 for 10M target
 const MAX_RETRY_COUNT      = 2;
 
+interface ScheduledEvent { cron: string; scheduledTime: number; }
+interface ExecutionContext { waitUntil(promise: Promise<any>): void; passThroughOnException(): void; }
 interface Fetcher { fetch(url: string, init?: RequestInit): Promise<Response> }
 interface Env {
   SUPABASE_URL:         string;
@@ -112,8 +114,9 @@ async function claimSource(env: Env, workerId: string): Promise<SourceQueueItem 
     .order("priority_score", { ascending: false })
     .limit(1);
 
-  if (!data || data.length === 0) return null;
-  const source = data[0] as SourceQueueItem;
+  const rows = data as any[];
+  if (!rows || rows.length === 0) return null;
+  const source = rows[0] as SourceQueueItem;
 
   const { error } = await d.from("sources_queue").update({
     status: "active", worker_id: workerId, heartbeat_at: now
@@ -149,11 +152,13 @@ async function releaseSource(
     const { data: row } = await d.from("sources_queue")
       .select("priority_score")
       .eq("source_id", sourceId);
-    if (row && row[0]) {
-      const newScore = Math.max(1, ((row[0] as any).priority_score ?? 50) - 10);
+    const priorityRows = row as any[];
+    if (priorityRows && priorityRows.length > 0) {
+      const firstRow = priorityRows[0];
+      const newScore = Math.max(1, (firstRow.priority_score ?? 50) - 10);
       await d.from("sources_queue")
         .update({ priority_score: newScore })
-        .eq("source_id", sourceId);
+        .eq("source_id", sourceId as string);
     }
   } else {
     await d.from("sources_queue").update({
@@ -163,10 +168,11 @@ async function releaseSource(
       error_message: errorMsg ?? "Unknown error",
     }).eq("source_id", sourceId);
 
-    const { data: row } = await d.from("sources_queue")
+    const { data: rowR } = await d.from("sources_queue")
       .select("retry_count")
       .eq("source_id", sourceId);
-    const rc = row && row[0] ? ((row[0] as any).retry_count ?? 0) + 1 : 1;
+    const retryRows = rowR as any[];
+    const rc = retryRows && retryRows.length > 0 ? (retryRows[0].retry_count ?? 0) + 1 : 1;
     await d.from("sources_queue")
       .update({ retry_count: rc })
       .eq("source_id", sourceId);
@@ -265,7 +271,7 @@ export default {
       return new Response(JSON.stringify({ status: "disabled" }), { status: 200 });
     }
     await checkSupabaseConnectivity(env);
-    const logger = new PipelineLogger(env);
+    const logger = new PipelineLogger(env as any);
     const workerId = `manual-${Date.now()}`;
     await processOneSlot(env, workerId, logger);
     await logger.flush();
@@ -279,7 +285,7 @@ export default {
       // FIX 2: Check Supabase connectivity first — visible in CF logs even if DB insert fails
       const dbOk = await checkSupabaseConnectivity(env);
 
-      const logger = new PipelineLogger(env);
+      const logger = new PipelineLogger(env as any);
       logger.log("CRON_TICK", {
         sample_count: CONCURRENT_SLOTS,
         // note: only valid worker_logs columns — extra fields cause PostgREST 400
