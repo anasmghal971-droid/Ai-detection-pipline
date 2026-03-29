@@ -355,17 +355,8 @@ async def label_batch(db: SupabaseClient, session: aiohttp.ClientSession) -> int
     return pushed
 
 async def check_and_push_shard(db: SupabaseClient, session: aiohttp.ClientSession):
-    """Trigger HF shard push when threshold is reached."""
-    count = await db.count("samples_processed", {"hf_pushed": "eq.false"})
-    log.info(f"  Unpushed processed rows: {count:,} (threshold: {SHARD_THRESHOLD:,})")
-    if count >= SHARD_THRESHOLD:
-        log.info(f"  Threshold reached! Triggering HF push...")
-        try:
-            import sys, subprocess
-            push_script = os.path.join(os.path.dirname(__file__), "..", "hf_push", "hf_push_manager.py")
-            subprocess.Popen([sys.executable, push_script], env=os.environ.copy())
-        except Exception as e:
-            log.error(f"Failed to trigger shard export: {e}")
+    """No-op stub — HF push is now handled inline in ensemble_labeler_once.py"""
+    pass
 
 async def main():
     log.info("=== DETECT-AI Labeler v2 started ===")

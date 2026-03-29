@@ -1,29 +1,42 @@
-name: AI Ensemble Labeler
+name: AI Label + HF Push
 
 on:
   schedule:
-    - cron: "*/2 * * * *"   # every 2 minutes
+    - cron: "*/5 * * * *"   # every 5 min (was 2 — gives more time per run)
   workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  label:
-    name: "🤖 Label Batch"
+  label-and-push:
+    name: "Label batch + push to HF"
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8    # enough for labeling + HF push (was 5)
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+
       - name: Install dependencies
-        run: pip install -r python/requirements.txt
-      - name: Run AI Labeler
+        run: |
+          pip install --upgrade pip
+          pip install \
+            aiohttp \
+            requests \
+            pandas \
+            pyarrow \
+            huggingface_hub
+
+      - name: Run label + HF push
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           HF_TOKEN:             ${{ secrets.HF_TOKEN }}
           HF_DATASET_REPO:      "anas775/DETECT-AI-Dataset"
-        run: python3 python/labeling/ensemble_labeler_once.py
+        run: |
+          python3 python/labeling/ensemble_labeler_once.py
