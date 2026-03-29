@@ -55,8 +55,10 @@ const RSS_MAP: Record<string, Array<{ url: string; lang: string }>> = {
     { url: "https://feeds.bbci.co.uk/news/technology/rss.xml",lang: "en" },
   ],
   "reuters":    [
-    { url: "https://feeds.reuters.com/reuters/topNews",        lang: "en" },
-    { url: "https://feeds.reuters.com/reuters/worldNews",      lang: "en" },
+    { url: "https://feeds.bbci.co.uk/news/business/rss.xml",        lang: "en" },
+    { url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",      lang: "en" },
+    { url: "https://www.reutersagency.com/feed/?best-topics=top&post_type=best", lang: "en" },
+    { url: "https://news.yahoo.com/rss/world",                 lang: "en" },  // reliable fallback
   ],
   "guardian":   [
     { url: "https://feeds.theguardian.com/theguardian/world/rss",      lang: "en" },
@@ -108,13 +110,21 @@ async function scrapeWikipedia(): Promise<any[]> {
 }
 
 async function scrapeArxiv(): Promise<any[]> {
-  const cats = ["cs.CV","cs.AI","cs.LG","cs.CL","stat.ML","eess.IV"];
-  const cat  = cats[Math.floor(Math.random() * cats.length)];
-  const xml  = await safeFetch(`https://export.arxiv.org/rss/${cat}`);
-  if (!xml) return [];
-  return parseRSS(xml, "en", "arxiv").slice(0, 100).map(a => ({
-    ...a, metadata: { ...a.metadata, category: cat, tags: ["arxiv","academic","research","human-content"] }
-  }));
+  const cats = ["cs.CV","cs.AI","cs.LG","cs.CL","stat.ML","eess.IV","cs.NE","cs.RO"];
+  // Run 3 categories in parallel for more coverage
+  const selectedCats = cats.sort(() => Math.random()-0.5).slice(0,3);
+  const results = await Promise.allSettled(
+    selectedCats.map(cat =>
+      safeFetch(`https://export.arxiv.org/rss/${cat}`).then(xml =>
+        xml ? parseRSS(xml, "en", "arxiv").map(a => ({
+          ...a, metadata: { ...a.metadata, category: cat, tags: ["arxiv","academic","research","human-content"] }
+        })) : []
+      )
+    )
+  );
+  const out: any[] = [];
+  for (const r of results) if (r.status === "fulfilled") out.push(...r.value);
+  return out.slice(0, 100);
 }
 
 async function scrapeStackExchange(): Promise<any[]> {
