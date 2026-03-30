@@ -2,7 +2,7 @@ name: Supabase Cleanup
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # every 2 hours
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 env:
@@ -10,34 +10,15 @@ env:
 
 jobs:
   cleanup:
-    name: "🧹 Clean Buffer + Vacuum"
+    name: "Clean buffer + delete pushed rows"
     runs-on: ubuntu-latest
     steps:
-      - name: Run cleanup + check storage
+      - name: Run auto_cleanup_pipeline
         run: |
-          echo "Running cleanup..."
           RESULT=$(curl -sf -X POST \
-            "${{ secrets.SUPABASE_URL }}/rest/v1/rpc/run_full_cleanup" \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/rpc/auto_cleanup_pipeline" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{}')
-          echo "Cleanup result: $RESULT"
-
-          echo "Storage usage:"
-          curl -sf \
-            "${{ secrets.SUPABASE_URL }}/rest/v1/storage_usage?select=table_name,total_size,live_rows" \
-            -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
-            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" | \
-            python3 -c "
-import sys, json
-try:
-    rows = json.load(sys.stdin)
-    total_mb = 0
-    for r in rows:
-        mb = r.get('total_size','0')
-        print(f'  {r[\"table_name\"]:28s} {mb:>10s}  ({r[\"live_rows\"]:>8,} rows)')
-except Exception as e:
-    print(f'Error: {e}')
-    print(sys.stdin.read()[:500])
-"
+          echo "Cleanup result: ${RESULT:-OK (empty = success)}"
