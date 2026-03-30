@@ -22,43 +22,55 @@ async function safeFetch(url: string, opts: RequestInit = {}): Promise<any> {
   } catch { return null; }
 }
 
-// FIXED: 1-3 subrequests (was 180+)
-// Removed per-video caption lookup and multiple topic loops
+// FIXED: RSS-based YouTube scraping — NO API key needed
+// YouTube public channels have RSS feeds at /feeds/videos.xml?channel_id=...
+// This gets metadata (title, description) for recent uploads — free, no quota
 async function scrapeYouTube(env: Env): Promise<any[]> {
-  const topics   = ["documentary","science","technology","education","history","culture","nature","engineering"];
-  const langs    = ["en","fr","de","es","ar","zh-Hans","ja","ko","pt","hi"];
-  const topic    = topics[Math.floor(Math.random() * topics.length)];
-  const langCode = langs[Math.floor(Math.random() * langs.length)];
+  // Popular educational/documentary channels (public RSS, no auth)
+  const channels = [
+    { id: "UCsooa4yRKGN_zEE8iknghZA", name: "TED-Ed" },
+    { id: "UC6nSFpj9HTCZ5t-N3Rm3-HA", name: "Vsauce" },
+    { id: "UCoOjH8D2XAgjzQlneM2W0EQ", name: "Wendover Productions" },
+    { id: "UCbmNph6atAoGfqLoCL_duAg", name: "Tom Scott" },
+    { id: "UCX6OQ3DkcsbYNE6H8uQQuVA", name: "MrBeast" },
+    { id: "UC9-y-6csu5WGm29I7JiwpnA", name: "Computerphile" },
+    { id: "UCWX3yGbODI3HLGAFAhpVEbw", name: "Real Engineering" },
+    { id: "UCHnyfMqiRRG1u-2MsSQLbXA", name: "Veritasium" },
+    { id: "UC7_gcs09iThXybpVgjHZ_7g", name: "PBS Space Time" },
+    { id: "UCsXVk37bltHxD1rDPwtNM8Q", name: "Kurzgesagt" },
+    { id: "UCivA7_KLKWo43tFcm8zOO5g", name: "Mark Rober" },
+    { id: "UCMOqf8ab-42UUQIdVoKwjlQ", name: "Practical Engineering" },
+  ];
+  const out: any[] = [];
+  // Pick 3 random channels per call to distribute across all
+  const selected = [...channels].sort(() => Math.random()-0.5).slice(0,3);
+  for (const ch of selected) {
+    try {
+      const r = await fetch(
+        `https://www.youtube.com/feeds/videos.xml?channel_id=${ch.id}`,
+        { signal: AbortSignal.timeout(8000), headers: {"User-Agent":"DETECT-AI/1.0"} }
+      );
+      if (!r.ok) continue;
+      const xml = await r.text();
+      // Parse Atom feed (YouTube uses Atom not RSS)
+      for (const m of xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)) {
+        const b = m[1];
+        const videoId = b.match(/<yt:videoId>(.*?)<\/yt:videoId>/)?.[1] ?? "";
+        const title   = b.match(/<title>(.*?)<\/title>/)?.[1]?.replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">") ?? "";
+        const desc    = b.match(/<media:description>([\s\S]*?)<\/media:description>/)?.[1]?.replace(/&amp;/g,"&").trim().slice(0,500) ?? "";
+        const pubDate = b.match(/<published>(.*?)<\/published>/)?.[1] ?? "";
+        if (videoId && title)
+          out.push({ source_url: `https://www.youtube.com/watch?v=${videoId}`,
+            raw_content: `${title}
 
-  const url = new URL("https://www.googleapis.com/youtube/v3/search");
-  url.searchParams.set("part", "snippet");
-  url.searchParams.set("q", topic);
-  url.searchParams.set("type", "video");
-  url.searchParams.set("relevanceLanguage", langCode.slice(0,2));
-  url.searchParams.set("videoDefinition", "high");
-  url.searchParams.set("videoLicense", "creativeCommon");
-  url.searchParams.set("maxResults", "50");
-  url.searchParams.set("key", env.YOUTUBE_API_KEY ?? "");
-
-  const d = await safeFetch(url.toString());
-  if (!d?.items) return [];
-
-  return (d.items as any[]).map((item:any) => {
-    const videoId = item.id?.videoId ?? "";
-    return {
-      source_url:  `https://www.youtube.com/watch?v=${videoId}`,
-      raw_content: `${item.snippet?.title ?? ""}\n\n${item.snippet?.description ?? ""}`.trim(),
-      metadata: {
-        video_id:     videoId,
-        title:        item.snippet?.title,
-        author:       item.snippet?.channelTitle,
-        publish_date: item.snippet?.publishedAt,
-        language:     langCode.slice(0,2),
-        license:      "YouTube-CC",
-        tags:         ["youtube","video",topic,langCode.slice(0,2)],
+${desc}`.trim(),
+            metadata: { video_id: videoId, title, channel: ch.name,
+              publish_date: pubDate, license: "YouTube Standard",
+              tags: ["youtube","video","educational","human"], is_ai_generated: false }});
       }
-    };
-  }).filter((s:any) => s.raw_content.length > 10);
+    } catch { continue; }
+  }
+  return out.slice(0, 50);
 }
 
 // FIXED: proper TED RSS parse (GraphQL was 500ing)
