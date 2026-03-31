@@ -2,7 +2,7 @@ name: Supabase Cleanup
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 */2 * * *"   # every 2 hours
   workflow_dispatch:
 
 env:
@@ -15,10 +15,20 @@ jobs:
     steps:
       - name: Run auto_cleanup_pipeline
         run: |
-          RESULT=$(curl -sf -X POST \
+          HTTP_CODE=$(curl -s -o /tmp/cleanup_result.json -w "%{http_code}" \
+            -X POST \
             "${{ secrets.SUPABASE_URL }}/rest/v1/rpc/auto_cleanup_pipeline" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{}')
-          echo "Cleanup result: ${RESULT:-OK (empty = success)}"
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "Result: $(cat /tmp/cleanup_result.json)"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "ERROR: Cleanup RPC returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "Cleanup complete"
