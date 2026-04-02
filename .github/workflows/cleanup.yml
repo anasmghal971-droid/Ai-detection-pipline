@@ -2,33 +2,59 @@ name: Supabase Cleanup
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # every 2 hours
+    - cron: "0 */2 * * *"
   workflow_dispatch:
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   cleanup:
-    name: "Clean buffer + delete pushed rows"
+    name: "Pipeline cleanup"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Run auto_cleanup_pipeline
+      - name: Run cleanup
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          HTTP_CODE=$(curl -s -o /tmp/cleanup_result.json -w "%{http_code}" \
-            -X POST \
-            "${{ secrets.SUPABASE_URL }}/rest/v1/rpc/auto_cleanup_pipeline" \
-            -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
-            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d '{}')
+          python3 - <<'PYEOF'
+import os, sys, urllib.request, urllib.error, json
 
-          echo "HTTP status: $HTTP_CODE"
-          echo "Result: $(cat /tmp/cleanup_result.json)"
+url = os.environ["SUPABASE_URL"].rstrip("/")
+key = os.environ["SUPABASE_SERVICE_KEY"]
 
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "ERROR: Cleanup RPC returned HTTP $HTTP_CODE"
-            exit 1
-          fi
+endpoint = f"{url}/rest/v1/rpc/auto_cleanup_pipeline"
+print(f"Calling: {endpoint}")
 
-          echo "Cleanup complete"
+req = urllib.request.Request(
+    endpoint,
+    data=b"{}",
+    headers={
+        "apikey":         key,
+        "Authorization":  f"Bearer {key}",
+        "Content-Type":   "application/json",
+        "Accept":         "application/json",
+    },
+    method="POST",
+)
+
+try:
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = resp.read().decode()
+        code = resp.status
+        print(f"HTTP {code}")
+        result = json.loads(body)
+        print(json.dumps(result, indent=2))
+        if not result.get("ok"):
+            print("ERROR: function returned ok=false")
+            sys.exit(1)
+        print("Cleanup complete")
+
+except urllib.error.HTTPError as e:
+    body = e.read().decode()
+    print(f"HTTP ERROR {e.code}: {body}")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR: {e}")
+    sys.exit(1)
+PYEOF

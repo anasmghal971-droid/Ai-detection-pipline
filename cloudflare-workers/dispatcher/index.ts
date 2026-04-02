@@ -146,7 +146,7 @@ async function releaseSource(
     const priorityRows = row as any[];
     if (priorityRows && priorityRows.length > 0) {
       const firstRow = priorityRows[0];
-      const newScore = Math.max(1, (firstRow.priority_score ?? 50) - 10);
+      const newScore = Math.max(10, (firstRow.priority_score ?? 50) - 5);  // min=10 so rotation still works; decrement=5 (was 10)
       await d.from("sources_queue")
         .update({ priority_score: newScore })
         .eq("source_id", sourceId as string);
